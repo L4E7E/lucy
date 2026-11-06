@@ -1,0 +1,13 @@
+[Unit]
+Description=Lucy status bar and notification service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/lucy-shell bar
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

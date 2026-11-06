@@ -1,0 +1,50 @@
+# Rust build output (Cargo.lock is intentionally tracked for this application).
+/target/
+**/*.rs.bk
+
+# Local credentials and environment overrides.
+.env
+.env.*
+!.env.example
+!.env.sample
+/.cargo/credentials
+/.cargo/credentials.toml
+.secrets/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+*.ovpn
+*.nmconnection
+
+# Runtime data, captures, and local diagnostics.
+/cache/
+/state/
+/logs/
+/tmp/
+/captures/
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+/core
+/core.[0-9]*
+
+# Editor, operating-system, and temporary files.
+/.idea/
+/.vscode/
+/.codex/
+.DS_Store
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+*.rej
+
+# Personal notes and machine-specific migration history; keep them locally.
+/메모장.txt
+/docs/legacy-gtk.md

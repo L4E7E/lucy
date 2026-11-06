@@ -1,0 +1,27 @@
+window.lucy-bar {
+  background: rgba(22,22,29,0.85); color: #f2f4f8;
+  border: 1px solid rgba(86,85,117,0.5); border-radius: 14px;
+}
+.lucy-bar box { background: transparent; }
+.lucy-bar button {
+  background: transparent; background-image: none; border: none;
+  box-shadow: none; text-shadow: none; border-radius: 8px;
+  min-height: 0; min-width: 0; padding: 0 7px; margin: 4px 0;
+  color: #f2f4f8;
+}
+.lucy-bar button:hover { background: #363646; }
+.lucy-bar .workspace { color: #c0c5d5; margin: 4px 2px; }
+.lucy-bar .workspace.active { background: #8ed8be; color: #1f1f28; }
+.lucy-bar .logo { color: #8ed8be; font-size: 1.5em; }
+.lucy-bar .temperature, .lucy-bar .network, .lucy-bar .bluetooth { color: #a2d9ca; }
+.lucy-bar .cpu { color: #a6ddec; }
+.lucy-bar .memory, .lucy-bar .battery { color: #b5e3a5; }
+.lucy-bar .disk { color: #cbb1f0; }
+.lucy-bar .backlight { color: #f4ce8f; }
+.lucy-bar .audio { color: #c6d3ff; }
+.lucy-bar .critical { color: #ff9ca8; }
+.lucy-bar .clock { padding: 0 12px; }
+.lucy-bar.compact { font-size: 0.9em; }
+.lucy-bar.compact button { padding: 0 4px; }
+tooltip { background: #1f1f28; color: #f2f4f8; border-radius: 10px; }
+tooltip label { padding: 6px 8px; }

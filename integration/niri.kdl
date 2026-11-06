@@ -1,0 +1,59 @@
+// Lucy popup blur only; keep click-dismiss surfaces fully transparent.
+// Keep the existing layout { struts { top 42; } } once; do not duplicate it.
+// Replace the existing Waybar startup command with:
+// spawn-at-startup "systemctl" "--user" "start" "lucy-bar.service"
+// Remove the Mako startup entry when enabling Lucy notifications.
+// Inside the existing binds block:
+// Ensure the installed lucy-shell is in the graphical session's PATH.
+// Mod+S { spawn "lucy-shell" "control"; }
+// Alt+Space { spawn "lucy-shell" "launcher"; }
+// Mod+Ctrl+Return { spawn "lucy-shell" "launcher"; }
+// Mod+Comma { spawn "lucy-shell" "control"; }
+// Mod+Shift+Q { spawn "lucy-shell" "control" "--page" "session"; }
+// Control and calendar borrow their original right/center bar wl_surface.
+// Keep bar corners at 14: the GPU material and Niri blur mask resize together.
+// The modal session scrim covers all outputs with one shared pixel.
+layer-rule {
+    match namespace="^lucy-session-backdrop$"
+    geometry-corner-radius 0
+    shadow { off; }
+    background-effect {
+        blur true
+        xray false
+    }
+}
+layer-rule {
+    match namespace="^lucy-session-popup$"
+    geometry-corner-radius 0
+    shadow { off; }
+    background-effect {
+        blur false
+        xray false
+    }
+}
+layer-rule {
+    match namespace="^lucy-bar-(left|center|right)$"
+    geometry-corner-radius 14
+    shadow { off; }
+    background-effect {
+        blur true
+        xray true
+    }
+}
+layer-rule {
+    match namespace="^lucy-(audio|network|control|calendar|launcher|notification)-popup$"
+    geometry-corner-radius 18
+    shadow { off; }
+    background-effect {
+        blur true
+        xray true
+    }
+}
+layer-rule {
+    match namespace="^lucy-(audio|network|control|calendar|launcher|expanded)-dismiss$"
+    shadow { off; }
+    background-effect {
+        blur false
+        xray false
+    }
+}

@@ -1,0 +1,10 @@
+// Merge only these actions into your existing Waybar configuration.
+{
+  "pulseaudio": {
+    "on-click": "lucy-shell audio"
+  },
+  "network": {
+    "on-click": "lucy-shell network",
+    "on-click-right": "lucy-shell network --vpn"
+  }
+}

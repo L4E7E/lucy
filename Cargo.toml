@@ -1,0 +1,38 @@
+[package]
+name = "lucy-shell"
+version = "0.3.0"
+edition = "2021"
+publish = false
+autobins = false
+description = "Lucy — minimal Rust desktop controls for Wayland"
+
+[dependencies]
+glow = "=0.16.0"
+gtk = { version = "=0.18.2", features = ["v3_24"], optional = true }
+glib = "=0.18.5"
+gio = "=0.18.4"
+cairo-rs = "=0.18.5"
+pango = "=0.18.3"
+gdk-pixbuf = "=0.18.5"
+memmap2 = "=0.9.10"
+libc = "=0.2.183"
+serde_json = "=1.0.149"
+wayland-client = { version = "=0.31.15", features = ["system"] }
+wayland-protocols = { version = "=0.32.13", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+
+[profile.release]
+strip = true
+opt-level = 2
+
+[features]
+legacy-gtk = ["dep:gtk"]
+
+[[bin]]
+name = "lucy-shell"
+path = "src/native/main.rs"
+
+[[bin]]
+name = "lucy-gtk"
+path = "src/main.rs"
+required-features = ["legacy-gtk"]

@@ -1,0 +1,6 @@
+[D-BUS Service]
+Name=org.freedesktop.Notifications
+# Fallback activation uses the graphical session's PATH. If needed, replace
+# this with the absolute path to the installed lucy-shell executable.
+Exec=/usr/bin/env lucy-shell bar
+SystemdService=lucy-bar.service

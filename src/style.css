@@ -1,0 +1,69 @@
+window.audio-popup, window.audio-dismiss {
+  background: transparent; background-image: none; box-shadow: none;
+  border: none; color: #f2f4f7;
+}
+.audio-card { background: rgba(25,27,34,0.8); border-radius: 12px; padding: 20px; }
+.audio-popup label { color: #f2f4f7; }
+.audio-popup .title { font-size: 1.25em; font-weight: bold; }
+.audio-popup .section { color: #8ed8be; font-weight: bold; }
+.audio-popup .subtle { color: #b2bac9; font-size: 0.85em; }
+.audio-popup .volume { color: #8ed8be; font-size: 0.92em; }
+.audio-popup button {
+  background: rgba(255,255,255,0.055); background-image: none; border: none;
+  box-shadow: none; text-shadow: none; color: #f2f4f7; border-radius: 7px;
+  min-height: 24px; padding: 3px 9px;
+}
+.audio-popup button:hover { background: rgba(142,216,190,0.18); }
+.audio-popup button:disabled { opacity: 0.4; }
+.audio-popup button:checked { background: rgba(142,216,190,0.22); color: #8ed8be; }
+.audio-popup scale { padding: 0; }
+.audio-popup scale trough {
+  min-height: 36px; min-width: 0; background: transparent; border: none; box-shadow: none;
+}
+.audio-popup scale highlight { min-height: 0; min-width: 0; background: transparent; border: none; box-shadow: none; }
+.audio-popup scale slider {
+  min-width: 0; min-height: 0; padding: 0; margin: 0; border: none;
+  background: transparent; background-image: none; box-shadow: none;
+}
+.audio-popup .gauge-icon { color: #f2f4f7; -gtk-icon-shadow: 0 1px 2px rgba(0,0,0,0.65); }
+.audio-popup button.gauge-icon { background: transparent; padding: 0; min-width: 24px; min-height: 26px; margin: 0 0 0 10px; }
+.audio-popup button.gauge-icon:hover { background: rgba(0,0,0,0.22); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35); border-radius: 8px; }
+.audio-popup button.gauge-icon:checked { background: rgba(0,0,0,0.12); }
+.audio-popup button.gauge-icon:checked:hover { background: rgba(0,0,0,0.28); }
+.audio-popup combobox button { padding: 3px 8px; }
+.audio-popup separator { background: rgba(255,255,255,0.08); min-height: 1px; }
+.audio-popup scrolledwindow, .audio-popup viewport { background: transparent; border: none; }
+.audio-popup scrollbar { background: transparent; padding: 0; border: none; }
+.audio-popup scrollbar.vertical trough { min-width: 6px; padding: 0; margin: 0; border: none; background: rgba(242,244,247,0.08); border-radius: 3px; }
+.audio-popup scrollbar.vertical slider { background: rgba(142,216,190,0.4); min-width: 6px; padding: 0; margin: 0; border: none; border-radius: 3px; }
+.audio-popup entry {
+  background: rgba(255,255,255,0.07); color: #f2f4f7; border: none;
+  box-shadow: none; border-radius: 7px; min-height: 30px; padding: 3px 9px;
+  caret-color: #8ed8be;
+}
+.audio-popup entry:focus { background: rgba(142,216,190,0.13); }
+.audio-popup stackswitcher button { padding: 6px 12px; }
+.audio-popup switch { background: rgba(255,255,255,0.13); border: none; box-shadow: none; }
+.audio-popup switch:checked { background: #8ed8be; }
+.audio-popup switch slider { background: #e4f4ef; border: none; box-shadow: none; }
+.audio-popup .network-row { padding: 7px 0; }
+.audio-popup .network-current { color: #8ed8be; }
+.audio-popup .network-tabs {
+  background: rgba(255,255,255,0.055); border-radius: 9px; padding: 3px;
+}
+.audio-popup .network-tabs button {
+  background: transparent; min-width: 0; margin: 0; padding: 6px 8px; border-radius: 7px;
+}
+.audio-popup .network-tabs button:checked { background: rgba(142,216,190,0.22); }
+.audio-popup .wifi-name { background: transparent; padding: 0; }
+.audio-popup .wifi-name:hover { background: rgba(142,216,190,0.06); }
+.audio-popup .wifi-lock { color: #8ed8be; }
+.control-center .cc-tile { background: rgba(255,255,255,0.045); border-radius: 10px; }
+.control-center .cc-tile button { margin: 0; padding: 10px 8px; border-radius: 10px; }
+.control-center .cc-tile .cc-arrow { padding: 5px 6px; min-width: 26px; }
+.control-center button.active { background: rgba(142,216,190,0.20); color: #a9e6d0; }
+.control-center .cc-media { background: rgba(255,255,255,0.045); padding: 16px; border-radius: 10px; }
+.control-center .cc-media button { padding: 7px 12px; }
+.control-center .album-art { background: rgba(255,255,255,0.06); border-radius: 10px; color: #8ed8be; }
+.control-center .cc-play { background: rgba(142,216,190,0.17); border-radius: 22px; }
+.control-center .cc-passive:disabled { opacity: 1; }
