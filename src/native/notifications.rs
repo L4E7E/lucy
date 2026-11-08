@@ -24,6 +24,25 @@ pub struct Notice {
     pub icon_name: String,
     pub actions: HashMap<String, String>,
     pub urgency: u8,
+    /// Unix receipt time. Older history may not contain a trustworthy timestamp.
+    pub received_at: Option<i64>,
+}
+
+pub fn time_label(received: Option<i64>, now: i64) -> String {
+    let Some(received) = received.filter(|t| *t > 0) else {
+        return String::new();
+    };
+    let age = now.saturating_sub(received).max(0);
+    if age >= 86_400 {
+        format!("{}일 전", age / 86_400)
+    } else if age >= 3_600 {
+        format!("{}시간 전", age / 3_600)
+    } else {
+        glib::DateTime::from_unix_local(received)
+            .and_then(|t| t.format("%H:%M"))
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
 }
 #[derive(Clone, Default)]
 pub struct State {
@@ -189,15 +208,8 @@ fn load_icons(shared: &Rc<RefCell<Shared>>) {
         let _ = tx.send(apps);
     });
 }
-fn routine_charge(app: &str, body: &str) -> bool {
-    app == "poweralertd"
-        && [
-            "Battery charging",
-            "Battery pending charge",
-            "Battery fully charged",
-        ]
-        .iter()
-        .any(|p| body.starts_with(p))
+pub(crate) fn poweralert(app: &str) -> bool {
+    app.trim().eq_ignore_ascii_case("poweralertd")
 }
 pub(crate) fn parse(value: &glib::Variant, active: bool) -> Vec<Notice> {
     if value.n_children() == 0 {
@@ -218,7 +230,7 @@ pub(crate) fn parse(value: &glib::Variant, active: bool) -> Vec<Notice> {
                     .unwrap_or_default()
             };
             let (app, body) = (get("app-name"), get("body"));
-            if routine_charge(&app, &body) {
+            if poweralert(&app) {
                 return None;
             }
             Some(Notice {
@@ -229,6 +241,10 @@ pub(crate) fn parse(value: &glib::Variant, active: bool) -> Vec<Notice> {
                 active,
                 actions: row.get("actions").and_then(|v| v.get()).unwrap_or_default(),
                 urgency: row.get("urgency").and_then(|v| v.get()).unwrap_or(1),
+                received_at: row
+                    .get("received-at")
+                    .and_then(|v| v.get::<i64>())
+                    .filter(|t| *t > 0),
                 icon_name: {
                     let icon = get("app-icon");
                     if !icon.is_empty() {
@@ -561,6 +577,31 @@ mod tests {
     use super::*;
     use glib::variant::ToVariant;
     #[test]
+    fn receipt_labels_use_local_clock_then_elapsed_hours_and_days() {
+        let now = glib::DateTime::from_local(2026, 11, 7, 22, 20, 0.0)
+            .unwrap()
+            .to_unix();
+        assert_eq!(time_label(Some(now - 120), now), "22:18");
+        assert_eq!(time_label(Some(now - 3_599), now), "21:20");
+        for (age, expected) in [
+            (3_600, "1시간 전"),
+            (86_399, "23시간 전"),
+            (86_400, "1일 전"),
+            (172_800, "2일 전"),
+        ] {
+            assert_eq!(time_label(Some(now - age), now), expected);
+        }
+        assert_eq!(time_label(Some(now + 60), now), "22:21");
+    }
+    #[test]
+    fn legacy_or_invalid_receipt_times_are_not_fabricated() {
+        for received in [None, Some(0), Some(-1), Some(i64::MAX)] {
+            assert_eq!(time_label(received, 1_800_000_000), "");
+        }
+        let rows = vec![HashMap::from([("id".to_owned(), 1u32.to_variant())])];
+        assert_eq!(parse(&(rows,).to_variant(), false)[0].received_at, None);
+    }
+    #[test]
     fn groups_are_case_insensitive_and_newest_first() {
         let rows =
             [(2, "Codex"), (5, "Mail"), (8, " codex "), (1, "Mail")].map(|(id, app)| Notice {
@@ -592,6 +633,7 @@ mod tests {
                 ("app-name".into(), "Codex".to_variant()),
                 ("summary".into(), "<b>완료</b>".to_variant()),
                 ("body".into(), "안녕 &amp; 테스트".to_variant()),
+                ("received-at".into(), 1_800_000_000i64.to_variant()),
             ]),
             HashMap::from([
                 ("id".to_owned(), 2u32.to_variant()),
@@ -606,6 +648,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].summary, "완료");
         assert_eq!(notices[0].body, "안녕 & 테스트");
+        assert_eq!(notices[0].received_at, Some(1_800_000_000));
     }
     #[test]
     fn active_and_history_are_deduplicated_newest_first() {
@@ -627,6 +670,7 @@ mod tests {
             vec![3, 2, 1]
         );
         assert!(result[1].active);
-        assert!(!routine_charge("poweralertd", "Battery critically low"));
+        assert!(poweralert(" PowerAlertD "));
+        assert!(!poweralert("Lucy"));
     }
 }

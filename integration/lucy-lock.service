@@ -1,0 +1,12 @@
+[Unit]
+Description=Lucy native Wayland session lock
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/lucy-shell lock --ready-notify
+TimeoutStartSec=10
+Restart=on-failure
+RestartSec=1

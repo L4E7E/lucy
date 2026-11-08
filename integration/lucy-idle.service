@@ -1,0 +1,15 @@
+[Unit]
+Description=Lucy lock integration for logind and suspend
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/swayidle -w before-sleep "%h/.local/bin/lucy-shell lock --daemonize || /usr/bin/swaylock -f" lock "%h/.local/bin/lucy-shell lock --daemonize || /usr/bin/swaylock -f"
+Restart=on-failure
+RestartSec=2
+# Restarting the idle watcher must not kill an already authenticated lock client.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

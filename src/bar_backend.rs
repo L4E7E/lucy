@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -30,6 +30,65 @@ pub(crate) enum Update {
     Outputs(Value),
 }
 
+fn niri_request(path: &Path, request: Value) -> std::io::Result<Value> {
+    let mut socket = UnixStream::connect(path)?;
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    socket.set_write_timeout(Some(Duration::from_millis(500)))?;
+    writeln!(socket, "{request}")?;
+    let mut reply = String::new();
+    BufReader::new(socket).take(65536).read_line(&mut reply)?;
+    let reply: Value = serde_json::from_str(&reply).map_err(std::io::Error::other)?;
+    if let Some(response) = reply.get("Ok") {
+        Ok(response.clone())
+    } else {
+        Err(std::io::Error::other(reply.to_string()))
+    }
+}
+
+fn focus_workspace_at(path: &Path, id: u64, skip_if_active: bool) -> std::io::Result<()> {
+    if skip_if_active {
+        let state = niri_request(path, "Workspaces".into())?;
+        if state["Workspaces"].as_array().is_some_and(|spaces| {
+            spaces
+                .iter()
+                .any(|w| w["id"].as_u64() == Some(id) && w["is_focused"] == true)
+        }) {
+            // Coalesced wheel events must not trigger Niri's auto-back-and-forth.
+            return Ok(());
+        }
+    }
+    // Niri's CLI numeric argument is an index, not the stable ID in its events.
+    niri_request(
+        path,
+        serde_json::json!({"Action":{"FocusWorkspace":{"reference":{"Id":id}}}}),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn focus_workspace(id: u64, skip_if_active: bool) {
+    static WORKER: OnceLock<mpsc::Sender<(u64, bool)>> = OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("lucy-workspace".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    // Keep rapid wheel events ordered without launching subprocesses.
+                    let (id, skip_if_active) = rx.try_iter().last().unwrap_or(first);
+                    if let Some(path) = env::var_os("NIRI_SOCKET") {
+                        if let Err(error) = focus_workspace_at(Path::new(&path), id, skip_if_active)
+                        {
+                            eprintln!("lucy-shell: workspace focus: {error}");
+                        }
+                    }
+                }
+            })
+            .expect("workspace worker");
+        tx
+    });
+    let _ = tx.send((id, skip_if_active));
+}
+
 pub(crate) fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -38,6 +97,15 @@ pub(crate) fn read(path: impl AsRef<Path>) -> String {
 }
 pub(crate) fn number(path: impl AsRef<Path>) -> Option<u64> {
     read(path).parse().ok()
+}
+fn soc_power(path: &Path) -> Option<Metric> {
+    let microwatts =
+        number(path.join("power1_average")).or_else(|| number(path.join("power1_input")))?;
+    Some(Metric {
+        text: format!("소비 전력 {:.1} W", microwatts as f64 / 1_000_000.0),
+        tooltip: "AMD SoC 전력 · 시스템 전체 소비 전력과 다릅니다".into(),
+        critical: false,
+    })
 }
 pub(crate) fn cpu_times(text: &str) -> Option<(u64, u64)> {
     let mut fields = text.lines().next()?.split_whitespace();
@@ -181,7 +249,15 @@ pub(crate) fn sample(previous: &mut Option<(u64, u64)>) -> State {
     }
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
-            if ["k10temp", "coretemp"].contains(&read(entry.path().join("name")).as_str()) {
+            let name = read(entry.path().join("name"));
+            if name == "amdgpu" && !state.values.contains_key("soc_power") {
+                if let Some(metric) = soc_power(&entry.path()) {
+                    state.values.insert("soc_power", metric);
+                }
+            }
+            if ["k10temp", "coretemp"].contains(&name.as_str())
+                && !state.values.contains_key("temperature")
+            {
                 if let Some(t) = number(entry.path().join("temp1_input")) {
                     state.values.insert(
                         "temperature",
@@ -191,7 +267,6 @@ pub(crate) fn sample(previous: &mut Option<(u64, u64)>) -> State {
                             critical: t >= 90000,
                         },
                     );
-                    break;
                 }
             }
         }
@@ -538,6 +613,63 @@ pub(crate) fn update_spaces(spaces: &mut Vec<Value>, event: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workspace_focus_sends_the_stable_id_not_the_cli_index() {
+        let root = std::env::temp_dir().join(format!(
+            "lucy-workspace-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("niri.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&socket).read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request["Action"]["FocusWorkspace"]["reference"],
+                serde_json::json!({"Id":73})
+            );
+            writeln!(socket, "{}", serde_json::json!({"Ok":"Handled"})).unwrap();
+        });
+        focus_workspace_at(&path, 73, false).unwrap();
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn wheel_does_not_trigger_auto_back_and_forth_on_the_current_workspace() {
+        let root = env::temp_dir().join(format!("lucy-workspace-noop-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("niri.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&socket).read_line(&mut request).unwrap();
+            assert_eq!(request.trim(), "\"Workspaces\"");
+            writeln!(
+                socket,
+                "{}",
+                serde_json::json!({"Ok":{"Workspaces":[{"id":73,"is_focused":true}]}})
+            )
+            .unwrap();
+            listener
+        });
+        focus_workspace_at(&path, 73, true).unwrap();
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "a redundant focus action would toggle back"
+        );
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn plugged_in_is_detected_even_when_battery_is_not_charging() {
         let root = std::env::temp_dir().join(format!(
             "lucy-power-test-{}-{}",
@@ -561,6 +693,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     use super::*;
+    #[test]
+    fn soc_sensor_converts_microwatts_and_falls_back_to_instantaneous_power() {
+        let root = std::env::temp_dir().join(format!(
+            "lucy-soc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(soc_power(&root).is_none());
+        fs::write(root.join("power1_input"), "14500000\n").unwrap();
+        assert_eq!(soc_power(&root).unwrap().text, "소비 전력 14.5 W");
+        fs::write(root.join("power1_average"), "11200000\n").unwrap();
+        assert_eq!(soc_power(&root).unwrap().text, "소비 전력 11.2 W");
+        fs::write(root.join("power1_average"), "unavailable\n").unwrap();
+        assert_eq!(soc_power(&root).unwrap().text, "소비 전력 14.5 W");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn cpu_excludes_guest_and_handles_reset() {
         assert_eq!(

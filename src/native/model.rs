@@ -1,3 +1,6 @@
+use super::bluetooth as bt;
+use super::display;
+use super::power;
 use crate::{
     audio_backend as audio, bar_backend as bar, control_backend as control, network_backend as net,
 };
@@ -46,6 +49,9 @@ impl Page {
 pub enum Slider {
     Volume,
     Brightness,
+    DisplayBrightness(String),
+    Temperature,
+    Media(String, String),
     Audio(String, u64),
 }
 #[derive(Clone, Debug)]
@@ -53,7 +59,25 @@ pub enum Action {
     Page(Page),
     Wifi,
     Bluetooth,
+    Bt(bt::Request),
+    BtForget(Option<String>),
     Profile,
+    Power(power::Request),
+    PowerExtra,
+    PowerSource(bool),
+    PowerAwake,
+    PowerPicker(power::Timer),
+    PowerClosePicker,
+    PowerMenu,
+    Display(display::Request),
+    DisplayMenu(Option<display::Menu>),
+    DisplayTab(bool),
+    DisplayIdentify,
+    DisplayMonitor,
+    DisplayTime(bool, display::ClockPart),
+    DisplayDrag(String, f64),
+    DisplayResetLayout,
+    DisplayApplyLayout,
     Mute,
     Slider(Slider),
     AudioMute(String, u64, bool),
@@ -88,6 +112,33 @@ pub enum Action {
     NotificationDnd,
     InvokeNotice(u32, String),
     Session(&'static str),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabGroup {
+    Network,
+    Profile,
+    Display,
+}
+struct WorkspaceWheel {
+    output: String,
+    delta: f64,
+    at: Instant,
+    active: u64,
+    target: u64,
+}
+struct ClockWheel {
+    start: bool,
+    part: display::ClockPart,
+    delta: f64,
+    at: Instant,
+}
+fn tab_group(action: &Action) -> Option<TabGroup> {
+    match action {
+        Action::Tab(_) => Some(TabGroup::Network),
+        Action::Power(power::Request::Profile(_)) => Some(TabGroup::Profile),
+        Action::DisplayTab(_) => Some(TabGroup::Display),
+        _ => None,
+    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rect {
@@ -147,10 +198,94 @@ pub fn profile_name(s: &str) -> &str {
     }
 }
 
+#[derive(Default)]
+pub struct PinInput {
+    pub value: String,
+    pub cursor: usize,
+    pub selected_all: bool,
+}
+impl PinInput {
+    pub fn insert(&mut self, text: &str) {
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if (if self.selected_all {
+            0
+        } else {
+            self.value.len()
+        }) + text.len()
+            > 64
+        {
+            return;
+        }
+        if self.selected_all {
+            *self = Self::default();
+        }
+        self.value.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+    }
+    pub fn backspace(&mut self) {
+        if self.selected_all {
+            *self = Self::default();
+            return;
+        }
+        let end = self.cursor;
+        self.move_cursor(-1);
+        self.value.replace_range(self.cursor..end, "");
+    }
+    pub fn delete(&mut self) {
+        if self.selected_all {
+            *self = Self::default();
+            return;
+        }
+        let start = self.cursor;
+        self.move_cursor(1);
+        self.value.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+    pub fn move_cursor(&mut self, direction: i32) {
+        self.selected_all = false;
+        if direction < 0 {
+            self.cursor = self.value[..self.cursor]
+                .char_indices()
+                .last()
+                .map_or(0, |(i, _)| i);
+        } else {
+            self.cursor += self.value[self.cursor..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8);
+        }
+    }
+}
 pub struct Model {
+    pub display: display::State,
+    pub display_tx: Option<mpsc::Sender<display::Request>>,
+    pub display_menu: Option<display::Menu>,
+    pub display_night: bool,
+    pub display_identify: bool,
+    display_clock_wheel: Option<ClockWheel>,
+    display_time_draft: Option<(u32, u32, Instant)>,
+    pub display_layout: Vec<display::Placement>,
+    display_drag: Option<(String, f64, f64, f64, i32, i32)>,
+    pub gamma_supported: bool,
+    pub gamma_active: bool,
+    pub gamma_error: String,
+    pub power: power::State,
+    pub power_tx: Option<mpsc::Sender<power::Request>>,
+    pub power_extra: bool,
+    pub power_ac: bool,
+    pub power_awake: bool,
+    pub power_idle_supported: bool,
+    pub power_picker: Option<power::Timer>,
+    pub bluetooth: bt::State,
+    pub bluetooth_tx: Option<glib::Sender<bt::Request>>,
+    pub bt_input: PinInput,
+    pub bt_deleting: Option<String>,
     pub notifications: super::notifications::State,
     pub popup_notices: Vec<super::notifications::Notice>,
     pub expanded_notifications: std::collections::HashSet<String>,
+    pub notice_revision: u64,
+    pub notice_exit: Option<Rect>,
+    pub removed_notices: std::collections::HashSet<u32>,
     pub notification_request: Option<super::notifications::Command>,
     pub pointer: Option<(u32, f64, f64)>,
     pub launcher: super::launcher::Launcher,
@@ -162,10 +297,12 @@ pub struct Model {
     pub page: Page,
     pub tab: String,
     pub common: control::State,
+    pub osd: Option<super::osd::State>,
     pub audio: Value,
     pub network: Option<net::State>,
     pub metrics: bar::State,
     pub workspaces: Vec<Value>,
+    workspace_wheel: Option<WorkspaceWheel>,
     pub bar_outputs: Value,
     pub font: String,
     pub hits: HashMap<u32, Vec<Hit>>,
@@ -186,8 +323,10 @@ pub struct Model {
     pub entry: bool,
     pub ensure_entry_visible: bool,
     pub preedit: String,
+    pub preedit_cursor: (i32, i32),
     pub busy: bool,
     pub scanning: bool,
+    wifi_scan_pending: bool,
     pub status: String,
     pub auth_prompt: bool,
     pub cover: Option<cairo::ImageSurface>,
@@ -203,6 +342,9 @@ pub struct Model {
     pub menu: Vec<super::tray::MenuEntry>,
     pub calendar_offset: i32,
     calendar_wheel_delta: f64,
+    tab_wheel_delta: f64,
+    tab_wheel_group: Option<TabGroup>,
+    tab_wheel_time: Instant,
     pub common_tx: Option<mpsc::Sender<control::Request>>,
     pub audio_tx: Option<mpsc::Sender<audio::Request>>,
     pub network_tx: Option<mpsc::Sender<net::Request>>,
@@ -215,8 +357,287 @@ pub struct Model {
     last_write: Instant,
     pub visible: bool,
     pub profile_pending: bool,
+    media_seek_draft: Option<(String, String, i64, Instant)>,
 }
 impl Model {
+    pub fn delete_surrounding(&mut self, before: u32, after: u32) {
+        let (value, cursor, selected) = match self.page {
+            Page::Launcher => (
+                &mut self.launcher.query,
+                &mut self.launcher.cursor,
+                self.launcher.selected_all,
+            ),
+            Page::Bluetooth => (
+                &mut self.bt_input.value,
+                &mut self.bt_input.cursor,
+                self.bt_input.selected_all,
+            ),
+            Page::Network if self.entry => (&mut self.secret, &mut self.cursor, self.selected_all),
+            _ => return,
+        };
+        if super::ime::delete_surrounding(value, cursor, selected, before, after)
+            && self.page == Page::Launcher
+        {
+            self.launcher.selected = 0;
+            self.launcher.keyboard_focus = !self.launcher.query.is_empty();
+            self.scroll = 0.0;
+        }
+    }
+    pub fn display_layout_changed(&self) -> bool {
+        !self.display_layout.is_empty()
+            && self.display.outputs.iter().any(|o| {
+                self.display_layout
+                    .iter()
+                    .find(|p| p.identity == o.identity)
+                    .is_some_and(|p| p.x != o.x || p.y != o.y)
+            })
+    }
+    pub fn display_dragging(&self) -> bool {
+        self.display_drag.is_some()
+    }
+    pub fn begin_display_drag(&mut self, name: String, factor: f64, x: f64, y: f64) {
+        if self.display.outputs.len() < 2
+            || self.display.pending.is_some()
+            || !factor.is_finite()
+            || factor <= 0.0
+        {
+            return;
+        }
+        if self.display_layout.is_empty() {
+            self.display_layout = self
+                .display
+                .outputs
+                .iter()
+                .map(display::Placement::from_output)
+                .collect();
+        }
+        if let Some(p) = self.display_layout.iter().find(|p| p.name == name) {
+            self.display_drag = Some((name, factor, x, y, p.x, p.y));
+        }
+    }
+    pub fn drag_display(&mut self, x: f64, y: f64) {
+        let Some((name, factor, sx, sy, ox, oy)) = self.display_drag.clone() else {
+            return;
+        };
+        let Some(output) = self.display.outputs.iter().find(|o| o.name == name) else {
+            return;
+        };
+        let (mut nx, mut ny) = (
+            ox + ((x - sx) / factor).round() as i32,
+            oy + ((y - sy) / factor).round() as i32,
+        );
+        for other in self.display_layout.iter().filter(|p| p.name != name) {
+            let Some(o) = self.display.outputs.iter().find(|o| o.name == other.name) else {
+                continue;
+            };
+            for edge in [
+                other.x,
+                other.x + o.logical_width as i32,
+                other.x - output.logical_width as i32,
+            ] {
+                if f64::from(nx - edge).abs() * factor < 9.0 {
+                    nx = edge;
+                }
+            }
+            for edge in [
+                other.y,
+                other.y + o.logical_height as i32,
+                other.y - output.logical_height as i32,
+            ] {
+                if f64::from(ny - edge).abs() * factor < 9.0 {
+                    ny = edge;
+                }
+            }
+        }
+        if let Some(p) = self.display_layout.iter_mut().find(|p| p.name == name) {
+            p.x = nx.clamp(-16000, 16000);
+            p.y = ny.clamp(-16000, 16000);
+        }
+    }
+    pub fn end_display_drag(&mut self) {
+        let Some((name, _, _, _, _, _)) = self.display_drag.take() else {
+            return;
+        };
+        if display::validate_placements(&self.display.outputs, &self.display_layout).is_err() {
+            let original = self.display_layout.clone();
+            let Some(p) = original.iter().find(|p| p.name == name) else {
+                return;
+            };
+            let Some(o) = self.display.outputs.iter().find(|o| o.name == name) else {
+                return;
+            };
+            let mut candidates = vec![];
+            for other in original.iter().filter(|p| p.name != name) {
+                if let Some(d) = self.display.outputs.iter().find(|d| d.name == other.name) {
+                    for (x, y) in [
+                        (other.x + d.logical_width as i32, other.y),
+                        (other.x - o.logical_width as i32, other.y),
+                        (other.x, other.y + d.logical_height as i32),
+                        (other.x, other.y - o.logical_height as i32),
+                    ] {
+                        candidates.push((
+                            i64::from(x - p.x).pow(2) + i64::from(y - p.y).pow(2),
+                            x,
+                            y,
+                        ));
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            for (_, x, y) in candidates {
+                let mut next = original.clone();
+                if let Some(p) = next.iter_mut().find(|p| p.name == name) {
+                    p.x = x;
+                    p.y = y;
+                }
+                if display::validate_placements(&self.display.outputs, &next).is_ok() {
+                    self.display_layout = next;
+                    break;
+                }
+            }
+        }
+        let mx = self.display_layout.iter().map(|p| p.x).min().unwrap_or(0);
+        let my = self.display_layout.iter().map(|p| p.y).min().unwrap_or(0);
+        for p in &mut self.display_layout {
+            p.x -= mx;
+            p.y -= my;
+        }
+    }
+    pub fn display_send(&mut self, request: display::Request) {
+        match &request {
+            display::Request::Night(v) => self.display.settings.night.enabled = *v,
+            display::Request::Automatic(v) => self.display.settings.night.automatic = *v,
+            display::Request::Time(start, part, steps) => {
+                if let Err(e) = self.display.settings.night.adjust(*start, *part, *steps) {
+                    self.display.error = e;
+                    return;
+                }
+                self.display.error.clear();
+                self.display_time_draft = Some((
+                    self.display.settings.night.start,
+                    self.display.settings.night.end,
+                    Instant::now(),
+                ));
+            }
+            _ => {}
+        }
+        if !self.readonly {
+            if let Some(tx) = &self.display_tx {
+                let _ = tx.send(request);
+            }
+        }
+    }
+    pub fn display_state(&mut self, mut state: display::State) {
+        if let Some((start, end, at)) = self.display_time_draft {
+            if !state.error.is_empty()
+                || (state.settings.night.start == start && state.settings.night.end == end)
+                || at.elapsed() > Duration::from_secs(3)
+            {
+                self.display_time_draft = None;
+            } else {
+                state.settings.night.start = start;
+                state.settings.night.end = end;
+            }
+        }
+        if (!display::same_layout(&state.outputs, &self.display.outputs))
+            || state
+                .outputs
+                .iter()
+                .map(|o| &o.identity)
+                .collect::<Vec<_>>()
+                != self
+                    .display
+                    .outputs
+                    .iter()
+                    .map(|o| &o.identity)
+                    .collect::<Vec<_>>()
+        {
+            self.display_layout.clear();
+            self.display_drag = None;
+            self.display_menu = None;
+        }
+        if self.dragging.is_some() || Instant::now() < self.quiet {
+            for output in &mut state.outputs {
+                if let Some(old) = self.display.outputs.iter().find(|o| o.name == output.name) {
+                    output.brightness = old.brightness;
+                }
+            }
+            state.settings.night.kelvin = self.display.settings.night.kelvin;
+        }
+        self.display = state;
+    }
+    pub fn power_send(&self, request: power::Request) {
+        if !self.readonly {
+            if let Some(tx) = &self.power_tx {
+                let _ = tx.send(request);
+            }
+        }
+    }
+    pub fn power_state(&mut self, state: power::State) {
+        if !self.power.ready {
+            self.power_ac = state.on_battery != Some(true);
+        }
+        if !state.busy {
+            self.profile_pending = false;
+            self.common.profile = state.profile.clone();
+            self.common.profiles = state.profiles.clone();
+        }
+        self.power = state;
+    }
+    pub fn bt_send(&self, request: bt::Request) {
+        if let Some(tx) = &self.bluetooth_tx {
+            // Preview is strictly read-only, including automatic discovery.
+            if !self.readonly {
+                let _ = tx.send(request);
+            }
+        }
+    }
+    pub fn bluetooth_state(&mut self, state: bt::State) {
+        let previous = self.bluetooth.prompt.as_ref().map(|p| p.id);
+        let next = state.prompt.as_ref().map(|p| p.id);
+        if previous != next {
+            self.bt_input = PinInput::default();
+            self.preedit.clear();
+        }
+        self.bluetooth = state;
+        self.common.bluetooth = self
+            .bluetooth
+            .adapter
+            .as_ref()
+            .map(|_| self.bluetooth.powered);
+        self.common.bluetooth_devices = Arc::new(
+            self.bluetooth
+                .devices
+                .iter()
+                .filter(|d| d.connected)
+                .map(|d| d.name.clone())
+                .collect(),
+        );
+        if self.page == Page::Bluetooth {
+            self.entry = self
+                .bluetooth
+                .prompt
+                .as_ref()
+                .is_some_and(bt::Prompt::input);
+            if previous != next && next.is_some() {
+                self.ensure_entry_visible = true;
+            }
+        }
+    }
+    pub fn bt_submit(&mut self) {
+        if let Some(prompt) = &self.bluetooth.prompt {
+            self.bt_send(bt::Request::Reply(
+                prompt.id,
+                Some(self.bt_input.value.clone()),
+            ));
+        }
+    }
+    pub fn spinning(&self) -> bool {
+        (self.busy && !self.auth_prompt)
+            || (self.page == Page::Power && self.power.busy)
+            || (self.page == Page::Display && !self.display.ready)
+            || (self.page == Page::Bluetooth && self.bluetooth.spinning())
+    }
     pub fn wifi_enabled(&self) -> bool {
         self.radio_pending.unwrap_or_else(|| {
             self.network
@@ -224,11 +645,47 @@ impl Model {
                 .map_or(self.common.wifi.unwrap_or(false), |s| s.wifi)
         })
     }
+    fn scan_wifi_on_entry(&mut self) -> bool {
+        if !self.wifi_scan_pending || self.readonly || self.busy {
+            return false;
+        }
+        if self.network.is_none() && self.common.wifi.is_none() {
+            return false; // Wait for the first snapshot, not a timer.
+        }
+        self.wifi_scan_pending = false;
+        if !self.wifi_enabled() {
+            return false;
+        }
+        self.start(net::Action::Scan);
+        true
+    }
     pub fn animating(&self) -> bool {
         Instant::now() < self.animation_until.get()
     }
     pub fn icon_value(&self, key: &str, target: f64) -> f64 {
         self.motion_value(key, target, Duration::from_millis(180))
+    }
+    pub fn tray_progress(&self) -> f64 {
+        self.motion_value(
+            "tray-open",
+            if self.tray_open { 1.0 } else { 0.0 },
+            Duration::from_millis(260),
+        )
+    }
+    pub fn power_extra_progress(&self) -> f64 {
+        self.motion_value(
+            "power-extra-open",
+            if self.power_extra { 1.0 } else { 0.0 },
+            Duration::from_millis(320),
+        )
+    }
+    pub fn tray_animating(&self) -> bool {
+        self.icon_values
+            .borrow()
+            .get("tray-open")
+            .is_some_and(|(from, to, start)| {
+                (from - to).abs() > 0.001 && start.elapsed() < Duration::from_millis(260)
+            })
     }
     pub fn motion_value(&self, key: &str, target: f64, duration: Duration) -> f64 {
         let now = Instant::now();
@@ -247,9 +704,36 @@ impl Model {
     }
     pub fn new() -> Self {
         Self {
+            display: display::State::default(),
+            display_tx: None,
+            display_menu: None,
+            display_night: false,
+            display_identify: false,
+            display_clock_wheel: None,
+            display_time_draft: None,
+            display_layout: vec![],
+            display_drag: None,
+            gamma_supported: false,
+            gamma_active: false,
+            gamma_error: String::new(),
+            power: power::State::default(),
+            osd: None,
+            power_tx: None,
+            power_extra: false,
+            power_ac: true,
+            power_awake: false,
+            power_idle_supported: false,
+            power_picker: None,
+            bluetooth: bt::State::default(),
+            bluetooth_tx: None,
+            bt_input: PinInput::default(),
+            bt_deleting: None,
             notifications: Default::default(),
             popup_notices: vec![],
             expanded_notifications: Default::default(),
+            notice_revision: 0,
+            notice_exit: None,
+            removed_notices: Default::default(),
             notification_request: None,
             pointer: None,
             launcher: super::launcher::Launcher::default(),
@@ -265,6 +749,7 @@ impl Model {
             network: None,
             metrics: bar::State::default(),
             workspaces: vec![],
+            workspace_wheel: None,
             bar_outputs: Value::Null,
             font: "Sans 11".into(),
             hits: HashMap::new(),
@@ -285,8 +770,10 @@ impl Model {
             entry: false,
             ensure_entry_visible: false,
             preedit: String::new(),
+            preedit_cursor: (0, 0),
             busy: false,
             scanning: false,
+            wifi_scan_pending: false,
             status: String::new(),
             auth_prompt: false,
             cover: None,
@@ -302,6 +789,9 @@ impl Model {
             menu: vec![],
             calendar_offset: 0,
             calendar_wheel_delta: 0.0,
+            tab_wheel_delta: 0.0,
+            tab_wheel_group: None,
+            tab_wheel_time: Instant::now(),
             common_tx: None,
             audio_tx: None,
             network_tx: None,
@@ -314,14 +804,36 @@ impl Model {
             last_write: Instant::now() - Duration::from_secs(1),
             visible: true,
             profile_pending: false,
+            media_seek_draft: None,
         }
     }
     pub fn navigate(&mut self, page: Page) {
+        if page != Page::Display {
+            self.display_menu = None;
+        }
+        if page == Page::Display && (self.page != page || !self.visible) {
+            self.display_send(display::Request::Refresh);
+        }
+        if page != Page::Power {
+            self.power_picker = None;
+        }
+        self.bt_send(bt::Request::Visible(page == Page::Bluetooth));
+        if page == Page::Network && self.tab == "wifi" {
+            if self.page != page || !self.visible {
+                self.wifi_scan_pending = !self.readonly && !self.busy;
+                self.scan_wifi_on_entry();
+            }
+        } else {
+            self.wifi_scan_pending = false;
+        }
         if page == Page::Launcher && self.page != page {
             self.launcher.reset_search();
         }
         if self.page == page {
             self.reveal = false;
+            if page == Page::Bluetooth {
+                self.ensure_entry_visible = self.entry;
+            }
             return;
         }
         self.page = page;
@@ -332,10 +844,83 @@ impl Model {
         self.device_menu = None;
         self.reveal = false;
         self.entry = page == Page::Launcher
+            || (page == Page::Bluetooth
+                && self
+                    .bluetooth
+                    .prompt
+                    .as_ref()
+                    .is_some_and(bt::Prompt::input))
             || (page == Page::Network && (self.wifi.is_some() || self.auth_prompt));
         self.ensure_entry_visible = self.entry;
     }
     pub fn common_state(&mut self, mut next: control::State) {
+        if let Some((player, track, position, at)) = &self.media_seek_draft {
+            if let Some(media) = next
+                .media
+                .as_mut()
+                .filter(|m| &m.player == player && &m.track == track)
+            {
+                let dragging =
+                    matches!(&self.dragging,Some((_,Slider::Media(p,t),_))if p==player&&t==track);
+                let now = Instant::now();
+                let elapsed = if media.playing {
+                    now.saturating_duration_since(*at).as_secs_f64() * media.rate * 1_000_000.0
+                } else {
+                    0.0
+                };
+                let expected = (*position as f64 + elapsed)
+                    .clamp(0.0, media.duration.unwrap_or(i64::MAX) as f64)
+                    as i64;
+                let acknowledged = !dragging
+                    && media.sampled.is_some_and(|t| t >= *at)
+                    && media
+                        .position_at(now)
+                        .is_some_and(|p| p.abs_diff(expected) <= 500_000);
+                if dragging
+                    || (!acknowledged && at.elapsed() < Duration::from_secs(3))
+                    || media.sampled.is_none_or(|t| t < *at)
+                {
+                    media.position = Some(*position);
+                    media.sampled = Some(*at);
+                } else {
+                    self.media_seek_draft = None;
+                }
+            } else {
+                self.media_seek_draft = None;
+            }
+        }
+        // Cached updates from other domains cannot acknowledge a seek or
+        // replace a newer playback clock. Apply this after seek validation.
+        if let (Some(old), Some(incoming)) = (&self.common.media, &mut next.media) {
+            if old.player == incoming.player
+                && old.track == incoming.track
+                && incoming.sampled < old.sampled
+            {
+                incoming.position = old.position;
+                incoming.sampled = old.sampled;
+                incoming.playing = old.playing;
+                incoming.rate = old.rate;
+            }
+        }
+        if self.power.ready {
+            next.profile = self.common.profile.clone();
+            next.profiles = self.power.profiles.clone();
+        }
+        if self.bluetooth.ready {
+            next.bluetooth = self
+                .bluetooth
+                .adapter
+                .as_ref()
+                .map(|_| self.bluetooth.powered);
+            next.bluetooth_devices = Arc::new(
+                self.bluetooth
+                    .devices
+                    .iter()
+                    .filter(|d| d.connected)
+                    .map(|d| d.name.clone())
+                    .collect(),
+            );
+        }
         if self.profile_pending {
             next.profile = self.common.profile.clone();
         }
@@ -345,7 +930,23 @@ impl Model {
             }
             next.brightness = self.common.brightness;
         }
+        if !matches!(self.dragging, Some((_, Slider::DisplayBrightness(_), _))) {
+            let internal = self
+                .display
+                .outputs
+                .iter()
+                .filter(|o| matches!(o.control, Some(display::Brightness::Backlight(_))))
+                .count();
+            if internal == 1 {
+                for output in &mut self.display.outputs {
+                    if matches!(output.control, Some(display::Brightness::Backlight(_))) {
+                        output.brightness = next.brightness;
+                    }
+                }
+            }
+        }
         self.common = next;
+        self.scan_wifi_on_entry();
     }
     fn write(&self, a: control::Action) {
         if let Some(tx) = &self.common_tx {
@@ -358,6 +959,11 @@ impl Model {
         }
     }
     pub fn hide(&mut self) {
+        self.display_drag = None;
+        self.display_menu = None;
+        self.wifi_scan_pending = false;
+        self.power_picker = None;
+        self.bt_send(bt::Request::Visible(false));
         if self.page == Page::Calendar {
             self.calendar_offset = 0;
             self.calendar_wheel_delta = 0.0;
@@ -375,6 +981,7 @@ impl Model {
         self.scroll_drag = None;
     }
     pub fn begin_scroll_drag(&mut self, id: u32, bar: Scrollbar, y: f64) {
+        self.power_picker = None;
         let grab = if y >= bar.thumb.y && y < bar.thumb.y + bar.thumb.h {
             y - bar.thumb.y
         } else {
@@ -402,6 +1009,201 @@ impl Model {
         self.calendar_offset += months;
         self.calendar_wheel_delta -= f64::from(months) * 15.0;
     }
+    pub fn workspace_scroll_target(&self) -> Option<u64> {
+        self.workspace_wheel.as_ref().map(|w| w.target)
+    }
+    pub fn scroll_workspaces(
+        &mut self,
+        window: u32,
+        output: &str,
+        x: f64,
+        y: f64,
+        delta: f64,
+    ) -> bool {
+        if !delta.is_finite() || delta == 0.0 || output.is_empty() {
+            return false;
+        }
+        let Some(hits) = self.hits.get(&window) else {
+            return false;
+        };
+        let mut region: Option<Rect> = None;
+        for h in hits
+            .iter()
+            .filter(|h| matches!(h.action, Action::Workspace(_)))
+        {
+            region = Some(match region {
+                None => h.rect,
+                Some(r) => Rect {
+                    x: r.x.min(h.rect.x),
+                    y: r.y.min(h.rect.y),
+                    w: (r.x + r.w).max(h.rect.x + h.rect.w) - r.x.min(h.rect.x),
+                    h: (r.y + r.h).max(h.rect.y + h.rect.h) - r.y.min(h.rect.y),
+                },
+            });
+        }
+        if !region.is_some_and(|r| r.contains(x, y)) {
+            return false;
+        }
+        let mut spaces: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|w| w["output"].as_str() == Some(output) && w["id"].as_u64().is_some())
+            .collect();
+        spaces.sort_by_key(|w| w["idx"].as_u64().unwrap_or(0));
+        let Some(active) = spaces
+            .iter()
+            .find(|w| w["is_active"] == true)
+            .and_then(|w| w["id"].as_u64())
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        let wheel = self.workspace_wheel.get_or_insert_with(|| WorkspaceWheel {
+            output: output.into(),
+            delta: 0.0,
+            at: now,
+            active,
+            target: active,
+        });
+        if wheel.output != output
+            || now.duration_since(wheel.at) > Duration::from_millis(240)
+            || !spaces
+                .iter()
+                .any(|w| w["id"].as_u64() == Some(wheel.target))
+        {
+            wheel.output = output.into();
+            wheel.target = active;
+            wheel.delta = 0.0;
+        }
+        // Track an optimistic target while compositor activation events catch up.
+        if wheel.active != active {
+            if wheel.target == wheel.active {
+                wheel.target = active;
+            }
+            wheel.active = active;
+        }
+        if wheel.delta * delta < 0.0 {
+            wheel.delta = 0.0;
+        }
+        wheel.at = now;
+        wheel.delta += delta;
+        let steps = (wheel.delta / 15.0).trunc() as i64;
+        if steps != 0 {
+            wheel.delta -= steps as f64 * 15.0;
+            let current = spaces
+                .iter()
+                .position(|w| w["id"].as_u64() == Some(wheel.target))
+                .unwrap_or(0);
+            let next = (current as i64)
+                .saturating_add(steps)
+                .clamp(0, spaces.len() as i64 - 1) as usize;
+            let target = spaces[next]["id"].as_u64().unwrap();
+            if target != wheel.target {
+                wheel.target = target;
+                if !self.readonly {
+                    bar::focus_workspace(target, true);
+                }
+            }
+        }
+        true
+    }
+    /// Only the pinned, top-level tabs consume wheel input. Segmented controls
+    /// inside the scrollable body must leave it for ordinary vertical scrolling.
+    pub fn scroll_tabs(&mut self, window: u32, x: f64, y: f64, delta: f64) -> bool {
+        if !delta.is_finite() {
+            return false;
+        }
+        let Some(hits) = self.hits.get(&window) else {
+            return false;
+        };
+        let Some(group) = hits
+            .iter()
+            .rev()
+            .find(|h| h.rect.contains(x, y) && tab_group(&h.action).is_some())
+            .and_then(|h| tab_group(&h.action))
+        else {
+            return false;
+        };
+        let mut choices: Vec<_> = hits
+            .iter()
+            .filter(|h| tab_group(&h.action) == Some(group))
+            .collect();
+        choices.sort_by(|a, b| a.rect.x.total_cmp(&b.rect.x));
+        let selected = choices
+            .iter()
+            .position(|h| match &h.action {
+                Action::Tab(tab) => tab == &self.tab,
+                Action::Power(power::Request::Profile(p)) => {
+                    self.common.profile.as_ref() == Some(p)
+                }
+                Action::DisplayTab(night) => self.display_night == *night,
+                _ => false,
+            })
+            .unwrap_or(0);
+        let now = Instant::now();
+        if self.tab_wheel_group != Some(group)
+            || now.duration_since(self.tab_wheel_time) > Duration::from_millis(240)
+            || self.tab_wheel_delta * delta < 0.0
+        {
+            self.tab_wheel_delta = 0.0;
+        }
+        self.tab_wheel_group = Some(group);
+        self.tab_wheel_time = now;
+        self.tab_wheel_delta += delta;
+        let steps = (self.tab_wheel_delta / 15.0).trunc() as i32;
+        if steps != 0 {
+            self.tab_wheel_delta -= f64::from(steps) * 15.0;
+            let next = (selected as i64 + i64::from(steps))
+                .clamp(0, choices.len().saturating_sub(1) as i64) as usize;
+            if next != selected {
+                let action = choices[next].action.clone();
+                self.activate(action);
+            }
+        }
+        true
+    }
+    pub fn scroll_display_time(&mut self, window: u32, x: f64, y: f64, delta: f64) -> bool {
+        if self.page != Page::Display || !self.display_night || !delta.is_finite() || delta == 0.0 {
+            return false;
+        }
+        let target = self.hits.get(&window).and_then(|hits| {
+            hits.iter().rev().find_map(|h| {
+                if let Action::DisplayTime(start, part) = h.action {
+                    h.rect.contains(x, y).then_some((start, part))
+                } else {
+                    None
+                }
+            })
+        });
+        let Some((start, part)) = target else {
+            self.display_clock_wheel = None;
+            return false;
+        };
+        let now = Instant::now();
+        let wheel = self.display_clock_wheel.get_or_insert(ClockWheel {
+            start,
+            part,
+            delta: 0.0,
+            at: now,
+        });
+        if wheel.start != start
+            || wheel.part != part
+            || now.duration_since(wheel.at) > Duration::from_millis(240)
+            || wheel.delta * delta < 0.0
+        {
+            wheel.delta = 0.0;
+        }
+        wheel.start = start;
+        wheel.part = part;
+        wheel.at = now;
+        wheel.delta += delta;
+        let steps = (wheel.delta / 15.0).trunc().clamp(-1440.0, 1440.0) as i32;
+        if steps != 0 {
+            wheel.delta -= f64::from(steps) * 15.0;
+            self.display_send(display::Request::Time(start, part, -steps));
+        }
+        true
+    }
     pub fn wifi_searching(&self) -> bool {
         self.busy && (self.scanning || self.radio_pending == Some(true)) && !self.auth_prompt
     }
@@ -423,21 +1225,112 @@ impl Model {
             return;
         }
         match a {
+            Action::DisplayTab(night) => {
+                self.display_night = night;
+                self.display_menu = None;
+                self.display_clock_wheel = None;
+                self.scroll = 0.0;
+            }
+            Action::DisplayIdentify => self.display_identify = true,
+            Action::DisplayMonitor | Action::DisplayTime(_, _) => {}
+            Action::DisplayDrag(_, _) => {}
+            Action::DisplayResetLayout => {
+                self.display_layout.clear();
+                self.display_drag = None;
+            }
+            Action::DisplayApplyLayout => {
+                if self.display_layout_changed() {
+                    self.display_send(display::Request::Place(self.display_layout.clone()));
+                }
+            }
+            Action::Display(request) => {
+                self.display_menu = None;
+                self.display_send(request);
+            }
+            Action::DisplayMenu(menu) => {
+                self.display_menu = if self.display_menu == menu {
+                    None
+                } else {
+                    menu
+                };
+            }
             Action::Page(page) => self.navigate(page),
             Action::Wifi => {
                 self.start(net::Action::Radio(!self.wifi_enabled()));
             }
-            Action::Bluetooth => self.write(control::Action::Bluetooth(
-                !self.common.bluetooth.unwrap_or(false),
-            )),
+            Action::Bluetooth => self.bt_send(bt::Request::Power(!self.bluetooth.powered)),
+            Action::Bt(request) => {
+                if let bt::Request::Remove(path) = &request {
+                    if self.bt_deleting.as_ref() != Some(path) {
+                        return;
+                    }
+                    self.bt_deleting = None;
+                }
+                self.bt_send(request);
+            }
+            Action::BtForget(path) => {
+                self.bt_deleting = path;
+                self.ensure_entry_visible = true;
+            }
             Action::Profile => {
                 if let Some(p) = next_profile(self.common.profile.as_deref(), &self.common.profiles)
                 {
                     self.common.profile = Some(p.clone());
-                    self.profile_pending = self.common_tx.is_some();
-                    self.write(control::Action::Profile(p));
+                    self.profile_pending = self.common_tx.is_some() || self.power_tx.is_some();
+                    if self.power_tx.is_some() {
+                        self.power_send(power::Request::Profile(p));
+                    } else {
+                        self.write(control::Action::Profile(p));
+                    }
                 }
             }
+            Action::Power(request) => {
+                if matches!(request, power::Request::Timeout(..)) {
+                    self.power_picker = None;
+                }
+                self.power_send(request);
+            }
+            Action::PowerExtra => {
+                self.power_extra_progress();
+                self.power_extra = !self.power_extra;
+                self.power_picker = None;
+            }
+            Action::PowerSource(ac) => {
+                self.power_ac = ac;
+                self.power_picker = None;
+            }
+            Action::PowerPicker(timer) => {
+                self.power_picker = if self.power_picker == Some(timer) {
+                    None
+                } else {
+                    Some(timer)
+                };
+                if self.power_picker.is_some() {
+                    if let Some(hits) = self.hits.get(&1) {
+                        let row = hits
+                            .iter()
+                            .find(|h| matches!(h.action, Action::PowerPicker(t) if t == timer));
+                        let bottom = hits.iter().find_map(|h| {
+                            if let Action::Scrollbar(b) = h.action {
+                                Some(b.track.y + b.track.h)
+                            } else {
+                                None
+                            }
+                        });
+                        if let (Some(row), Some(bottom)) = (row, bottom) {
+                            let menu_height = super::draw::power_ui::menu_height(timer);
+                            self.scroll +=
+                                (row.rect.y + row.rect.h + menu_height + 12.0 - bottom).max(0.0);
+                        }
+                    }
+                }
+            }
+            Action::PowerClosePicker => self.power_picker = None,
+            Action::PowerMenu => {}
+            Action::PowerAwake if self.power_idle_supported && !self.readonly => {
+                self.power_awake = !self.power_awake
+            }
+            Action::PowerAwake => {}
             Action::Mute => self.write(control::Action::Mute),
             Action::AudioMute(kind, id, muted) => self.audio_write(vec![
                 format!("set-{kind}-mute"),
@@ -456,9 +1349,12 @@ impl Model {
                 self.device_menu = None;
             }
             Action::Tab(tab) => {
+                let entering_wifi = tab == "wifi" && self.tab != tab;
                 self.tab = tab;
                 self.scroll = 0.0;
-                self.entry = false;
+                self.entry = self.tab == "wifi" && (self.wifi.is_some() || self.auth_prompt);
+                self.wifi_scan_pending = entering_wifi && !self.readonly && !self.busy;
+                self.scan_wifi_on_entry();
             }
             Action::Scan if self.wifi_enabled() && !self.busy => self.start(net::Action::Scan),
             Action::Scan => {}
@@ -515,7 +1411,13 @@ impl Model {
             }
             Action::Secret => self.entry = true,
             Action::Eye => self.reveal = !self.reveal,
-            Action::Submit => self.submit(),
+            Action::Submit => {
+                if self.page == Page::Bluetooth {
+                    self.bt_submit();
+                } else {
+                    self.submit();
+                }
+            }
             Action::Cancel => {
                 self.cancel.store(true, Ordering::Release);
                 self.wipe_secret();
@@ -528,10 +1430,7 @@ impl Model {
                     });
                 }
             }
-            Action::Workspace(id) => bar::action(
-                "niri",
-                &["msg", "action", "focus-workspace", &id.to_string()],
-            ),
+            Action::Workspace(id) => bar::focus_workspace(id, false),
             Action::Launch => bar::lucy(&["launcher"]),
             Action::Search => self.entry = true,
             Action::App(id) => {
@@ -553,19 +1452,28 @@ impl Model {
             Action::NoticeHover => {}
             Action::Scrollbar(_) => {}
             Action::DeleteNotices(ids) => {
+                self.prepare_notice_exit(&ids);
+                self.removed_notices.extend(ids.iter().copied());
+                self.notifications.notices.retain(|n| !ids.contains(&n.id));
                 if !self.readonly {
-                    self.notifications.notices.retain(|n| !ids.contains(&n.id));
                     self.notification_request = Some(super::notifications::Command::Delete(ids));
                 }
             }
             Action::ClearNotices => {
+                let ids: Vec<_> = self.notifications.notices.iter().map(|n| n.id).collect();
+                self.notice_exit = Some(Rect {
+                    x: super::notifications::LIST_X,
+                    y: 62.0,
+                    w: f64::from(super::notifications::WIDTH) - super::notifications::LIST_X - 20.0,
+                    h: self.viewport_height,
+                });
+                self.notice_revision = self.notice_revision.wrapping_add(1);
+                self.removed_notices.extend(ids.iter().copied());
                 if !self.readonly {
-                    self.notification_request = Some(super::notifications::Command::Delete(
-                        self.notifications.notices.iter().map(|n| n.id).collect(),
-                    ));
-                    self.notifications.notices.clear();
-                    self.scroll = 0.0;
+                    self.notification_request = Some(super::notifications::Command::Delete(ids));
                 }
+                self.notifications.notices.clear();
+                self.scroll = 0.0;
             }
             Action::NotificationDnd => {
                 if !self.readonly {
@@ -581,7 +1489,7 @@ impl Model {
             }
             Action::Session(command) => {
                 match command {
-                    "lock" => bar::action("loginctl", &["lock-session"]),
+                    "lock" => bar::lucy(&["lock", "--daemonize"]),
                     "suspend" => bar::action("systemctl", &["suspend"]),
                     "logout" => bar::action("niri", &["msg", "action", "quit"]),
                     "reboot" => bar::action("systemctl", &["reboot"]),
@@ -594,8 +1502,36 @@ impl Model {
         }
     }
     pub fn slider(&mut self, target: &Slider, value: f64, force: bool) {
+        if let Slider::Media(player, track) = target {
+            if !value.is_finite() {
+                return;
+            }
+            let Some(media) = self
+                .common
+                .media
+                .as_mut()
+                .filter(|m| &m.player == player && &m.track == track && m.seekable())
+            else {
+                return;
+            };
+            let position =
+                (media.duration.unwrap() as f64 * value.clamp(0.0, 100.0) / 100.0).round() as i64;
+            let position = position.min(media.duration.unwrap().saturating_sub(1));
+            let now = Instant::now();
+            media.position = Some(position);
+            media.sampled = Some(now);
+            self.media_seek_draft = Some((player.clone(), track.clone(), position, now));
+            if force && self.dragging.is_none() && !self.readonly {
+                self.write(control::Action::MediaSeek {
+                    player: player.clone(),
+                    track: track.clone(),
+                    position,
+                });
+            }
+            return;
+        }
         let v = value.round().clamp(
-            if *target == Slider::Brightness {
+            if matches!(target, Slider::Brightness | Slider::DisplayBrightness(_)) {
                 1.0
             } else {
                 0.0
@@ -608,6 +1544,22 @@ impl Model {
                 self.common.audio = Some((f64::from(v), self.common.audio.is_some_and(|a| a.1)))
             }
             Slider::Brightness => self.common.brightness = Some(f64::from(v)),
+            Slider::DisplayBrightness(name) => {
+                if let Some(o) = self.display.outputs.iter_mut().find(|o| &o.name == name) {
+                    o.brightness = Some(f64::from(v));
+                    if matches!(o.control, Some(display::Brightness::Backlight(_))) {
+                        self.common.brightness = o.brightness;
+                    }
+                }
+            }
+            Slider::Temperature => {
+                self.display.settings.night.kelvin = display::MIN_KELVIN
+                    + ((f64::from(v) / 100.0 * f64::from(display::MAX_KELVIN - display::MIN_KELVIN)
+                        / 50.0)
+                        .round() as u32)
+                        * 50
+            }
+            Slider::Media(_, _) => unreachable!(),
             Slider::Audio(kind, id) => {
                 let collection = collection(kind);
                 if let Some(items) = self.audio[collection].as_array_mut() {
@@ -631,8 +1583,84 @@ impl Model {
         match target {
             Slider::Volume => self.write(control::Action::Volume(v)),
             Slider::Brightness => self.write(control::Action::Brightness(v)),
+            Slider::DisplayBrightness(name) => {
+                self.display_send(display::Request::Brightness(name.clone(), v))
+            }
+            Slider::Temperature => self.display_send(display::Request::Temperature(
+                self.display.settings.night.kelvin,
+            )),
             Slider::Audio(kind, id) => self.audio_write(audio::volume_command(kind, *id, v)),
+            Slider::Media(_, _) => unreachable!(),
         }
+    }
+    pub fn media_position(&self) -> Option<i64> {
+        let media = self.common.media.as_ref()?;
+        if matches!(&self.dragging,Some((_,Slider::Media(player,track),_))if player==&media.player&&track==&media.track)
+        {
+            media.position
+        } else {
+            media.position_at(Instant::now())
+        }
+    }
+    pub fn media_pending(&self) -> bool {
+        self.media_seek_draft.is_some()
+    }
+    pub fn media_progress(&self) -> f64 {
+        self.common
+            .media
+            .as_ref()
+            .and_then(|m| m.duration)
+            .filter(|d| *d > 0)
+            .map_or(0.0, |duration| {
+                self.media_position().unwrap_or(0) as f64 / duration as f64 * 100.0
+            })
+    }
+    pub fn notification_state(&mut self, mut state: super::notifications::State) {
+        // Optimistic deletion must not be undone by an already queued snapshot.
+        self.removed_notices
+            .retain(|id| state.notices.iter().any(|n| n.id == *id));
+        state
+            .notices
+            .retain(|n| !self.removed_notices.contains(&n.id));
+        self.notifications = state;
+    }
+    fn prepare_notice_exit(&mut self, ids: &[u32]) {
+        let hits = self.hits.get(&1);
+        let close = hits.and_then(|hits| hits.iter().find(|h| matches!(&h.action, Action::DeleteNotices(found) if found.iter().any(|id| ids.contains(id)))));
+        let card = close.and_then(|close| {
+            hits?.iter().find(|h| {
+                matches!(h.action, Action::NoticeHover)
+                    && h.rect.contains(close.rect.x + 14.0, close.rect.y + 14.0)
+            })
+        });
+        let mut rect = card.map(|h| h.rect).unwrap_or(Rect {
+            x: super::notifications::LIST_X,
+            y: 62.0,
+            w: f64::from(super::notifications::WIDTH) - super::notifications::LIST_X - 20.0,
+            h: self.viewport_height,
+        });
+        if let Some(notice) = self
+            .notifications
+            .notices
+            .iter()
+            .find(|n| ids.contains(&n.id))
+        {
+            if self
+                .notifications
+                .notices
+                .iter()
+                .filter(|n| n.app.eq_ignore_ascii_case(&notice.app))
+                .all(|n| ids.contains(&n.id))
+            {
+                rect.y -= 48.0;
+                rect.h += 48.0 + 28.0;
+            } else {
+                rect.h += 10.0;
+            }
+        }
+        rect.y = rect.y.max(62.0);
+        self.notice_exit = Some(rect);
+        self.notice_revision = self.notice_revision.wrapping_add(1);
     }
     pub fn audio_state(&mut self, mut next: Value) {
         if Instant::now() < self.quiet {
@@ -676,6 +1704,12 @@ impl Model {
         self.preedit.clear();
     }
     pub fn insert(&mut self, text: &str) {
+        if self.page == Page::Bluetooth {
+            if self.entry {
+                self.bt_input.insert(text);
+            }
+            return;
+        }
         if self.page == Page::Launcher {
             self.launcher.insert(text);
             self.scroll = 0.0;
@@ -692,6 +1726,10 @@ impl Model {
         }
     }
     pub fn backspace(&mut self) {
+        if self.page == Page::Bluetooth {
+            self.bt_input.backspace();
+            return;
+        }
         if self.page == Page::Launcher {
             self.launcher.backspace();
             self.scroll = 0.0;
@@ -711,6 +1749,10 @@ impl Model {
         }
     }
     pub fn move_cursor(&mut self, direction: i32) {
+        if self.page == Page::Bluetooth {
+            self.bt_input.move_cursor(direction);
+            return;
+        }
         if self.page == Page::Launcher {
             self.launcher.move_cursor(direction > 0);
             return;
@@ -729,6 +1771,10 @@ impl Model {
         }
     }
     pub fn delete(&mut self) {
+        if self.page == Page::Bluetooth {
+            self.bt_input.delete();
+            return;
+        }
         if self.page == Page::Launcher {
             self.launcher.delete();
             self.scroll = 0.0;
@@ -746,6 +1792,11 @@ impl Model {
         }
     }
     pub fn settle(&mut self, domain: control::Domain, success: bool) {
+        if domain == control::Domain::Media && !success && self.media_seek_draft.take().is_some() {
+            if let Some(tx) = &self.common_tx {
+                let _ = tx.send(control::Request::MediaPosition);
+            }
+        }
         if success && !self.busy {
             self.status.clear();
         }
@@ -782,7 +1833,7 @@ impl Model {
         }
     }
     pub fn start(&mut self, action: net::Action) {
-        if self.busy {
+        if self.readonly || self.busy {
             return;
         }
         let Some(events) = self.net_events.clone() else {
@@ -871,6 +1922,7 @@ impl Model {
                     self.status = "Wi-Fi 검색 중…".into();
                 }
                 self.network = Some(s);
+                self.scan_wifi_on_entry();
             }
             net::Event::AccessPoints(aps) => {
                 if let Some(s) = &mut self.network {
@@ -903,17 +1955,22 @@ impl Model {
                 self.reveal = false;
             }
             net::Event::Finished(result) => {
+                let scan = self.scanning;
                 self.radio_pending = None;
                 self.busy = false;
                 self.scanning = false;
                 self.auth_prompt = false;
                 self.replies = None;
-                self.wipe_secret();
-                if let Some(mut p) = self.prefill.take() {
-                    p.fill(0);
+                // A background refresh must not discard an unfinished password
+                // when the user reopens the Wi-Fi page.
+                if !scan {
+                    self.wipe_secret();
+                    if let Some(mut p) = self.prefill.take() {
+                        p.fill(0);
+                    }
+                    self.wifi = None;
                 }
                 self.status = result.err().unwrap_or_default();
-                self.wifi = None;
             }
         }
     }
@@ -942,6 +1999,486 @@ pub fn collection(kind: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delayed_media_reports_cannot_undo_drag_or_acknowledge_the_wrong_position() {
+        use super::*;
+        let mut m = Model::new();
+        m.common.media = Some(control::Media {
+            player: "test".into(),
+            track: "/track/one".into(),
+            duration: Some(180_000_000),
+            position: Some(10_000_000),
+            can_seek: true,
+            sampled: Some(Instant::now()),
+            ..Default::default()
+        });
+        let cached = m.common.clone();
+        let slider = Slider::Media("test".into(), "/track/one".into());
+        m.dragging = Some((
+            1,
+            slider.clone(),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 20.0,
+            },
+        ));
+        m.slider(&slider, 75.0, true);
+        let mut late = cached.clone();
+        late.media.as_mut().unwrap().sampled = Some(Instant::now());
+        m.common_state(late.clone());
+        assert_eq!(m.media_position(), Some(135_000_000));
+        assert!(m.media_pending());
+        m.dragging = None;
+        m.slider(&slider, 80.0, true);
+        // Even a newly sampled GetAll can still report the position before the
+        // application's asynchronous seek finishes.
+        for _ in 0..5 {
+            late.media.as_mut().unwrap().sampled = Some(Instant::now());
+            m.common_state(late.clone());
+            assert_eq!(m.media_position(), Some(144_000_000));
+            assert!(m.media_pending());
+        }
+        m.common_state(cached.clone());
+        assert!(m.media_pending());
+        let mut confirmed = late;
+        confirmed.media.as_mut().unwrap().position = Some(144_000_000);
+        confirmed.media.as_mut().unwrap().sampled = Some(Instant::now());
+        m.common_state(confirmed);
+        assert!(!m.media_pending());
+        m.common_state(cached);
+        assert_eq!(m.media_position(), Some(144_000_000));
+    }
+    #[test]
+    fn media_drag_seeks_once_on_release_and_rejects_stale_tracks() {
+        use super::*;
+        let mut m = Model::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.common_tx = Some(tx);
+        m.common.media = Some(control::Media {
+            player: "test".into(),
+            track: "/track/one".into(),
+            duration: Some(180_000_000),
+            position: Some(0),
+            can_seek: true,
+            ..Default::default()
+        });
+        let slider = Slider::Media("test".into(), "/track/one".into());
+        m.dragging = Some((
+            1,
+            slider.clone(),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 20.0,
+            },
+        ));
+        m.slider(&slider, 25.125, true);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(m.media_position(), Some(45_225_000));
+        m.dragging = None;
+        m.slider(&slider, 50.5, true);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            control::Request::Write(control::Action::MediaSeek {
+                position: 90_900_000,
+                ..
+            })
+        ));
+        m.common.media.as_mut().unwrap().track = "/track/two".into();
+        m.slider(&slider, 75.0, true);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(m.common.media.as_ref().unwrap().position, Some(90_900_000));
+    }
+    #[test]
+    fn display_countdown_does_not_close_an_open_selector() {
+        use super::*;
+        let mut m = Model::new();
+        m.display_menu = Some(display::Menu::Scale("eDP-1".into()));
+        let mut state = m.display.clone();
+        state.pending = Some(display::Pending {
+            before: vec![],
+            after: vec![],
+            deadline: Instant::now() + Duration::from_secs(15),
+        });
+        m.display_state(state);
+        assert_eq!(m.display_menu, Some(display::Menu::Scale("eDP-1".into())));
+    }
+    #[test]
+    fn schedule_wheel_consumes_only_clock_fields_and_keeps_draft_through_old_snapshots() {
+        use super::*;
+        let mut m = Model::new();
+        m.readonly = true;
+        m.page = Page::Display;
+        m.display_night = true;
+        m.display.settings.night.start = 21 * 60 + 59;
+        m.display.settings.night.end = 7 * 60;
+        m.hits.insert(
+            1,
+            vec![
+                Hit {
+                    rect: Rect {
+                        x: 200.0,
+                        y: 200.0,
+                        w: 60.0,
+                        h: 34.0,
+                    },
+                    action: Action::DisplayTime(true, display::ClockPart::Hour),
+                },
+                Hit {
+                    rect: Rect {
+                        x: 280.0,
+                        y: 200.0,
+                        w: 60.0,
+                        h: 34.0,
+                    },
+                    action: Action::DisplayTime(true, display::ClockPart::Minute),
+                },
+            ],
+        );
+        assert!(!m.scroll_display_time(1, 100.0, 200.0, -15.0));
+        assert!(m.scroll_display_time(1, 220.0, 210.0, -5.0));
+        assert_eq!(m.display.settings.night.start, 21 * 60 + 59);
+        assert!(m.scroll_display_time(1, 220.0, 210.0, -10.0));
+        assert_eq!(m.display.settings.night.start, 22 * 60 + 59);
+        m.scroll_display_time(1, 300.0, 210.0, -15.0);
+        assert_eq!(m.display.settings.night.start, 22 * 60);
+        assert_eq!(m.display.settings.night.end, 7 * 60);
+        let old = display::State::default();
+        m.display_state(old);
+        assert_eq!(m.display.settings.night.start, 22 * 60);
+        let mut confirmed = display::State::default();
+        confirmed.settings.night.start = 22 * 60;
+        m.display_state(confirmed);
+        assert!(m.display_time_draft.is_none());
+        assert!(!m.scroll_display_time(1, 300.0, 210.0, f64::NAN));
+    }
+    #[test]
+    fn workspace_wheel_uses_output_local_order_and_accumulates_fine_input() {
+        use super::*;
+        let mut m = Model::new();
+        m.readonly = true; // Never focus the real compositor in tests.
+        m.workspaces = vec![
+            serde_json::json!({"id":73,"idx":3,"output":"eDP-1","is_active":false}),
+            serde_json::json!({"id":8,"idx":1,"output":"DP-1","is_active":true}),
+            serde_json::json!({"id":22,"idx":2,"output":"eDP-1","is_active":false}),
+            serde_json::json!({"id":11,"idx":1,"output":"eDP-1","is_active":true}),
+        ];
+        m.hits.insert(
+            4,
+            [11, 22, 73]
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| Hit {
+                    rect: Rect {
+                        x: 44.0 + i as f64 * 32.0,
+                        y: 3.0,
+                        w: 28.0,
+                        h: 28.0,
+                    },
+                    action: Action::Workspace(id),
+                })
+                .collect(),
+        );
+        assert!(!m.scroll_workspaces(4, "eDP-1", 23.0, 17.0, 15.0));
+        assert!(!m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, f64::NAN));
+        // The small gaps between dots belong to the indicator too.
+        assert!(m.scroll_workspaces(4, "eDP-1", 74.0, 17.0, 5.0));
+        assert_eq!(m.workspace_scroll_target(), Some(11));
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, 10.0);
+        assert_eq!(m.workspace_scroll_target(), Some(22));
+        // Advance again even before Niri publishes the first activation event.
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, 15.0);
+        assert_eq!(m.workspace_scroll_target(), Some(73));
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, 150.0);
+        assert_eq!(m.workspace_scroll_target(), Some(73));
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, -15.0);
+        assert_eq!(m.workspace_scroll_target(), Some(22));
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, -150.0);
+        assert_eq!(m.workspace_scroll_target(), Some(11));
+        m.scroll_workspaces(4, "DP-1", 58.0, 17.0, 15.0);
+        assert_eq!(m.workspace_scroll_target(), Some(8));
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, 10.0);
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, -5.0);
+        assert_eq!(m.workspace_wheel.as_ref().unwrap().delta, -5.0);
+        m.workspace_wheel.as_mut().unwrap().at = Instant::now() - Duration::from_secs(1);
+        m.scroll_workspaces(4, "eDP-1", 58.0, 17.0, 10.0);
+        assert_eq!(m.workspace_wheel.as_ref().unwrap().delta, 10.0);
+    }
+    #[test]
+    fn wifi_entry_waits_for_state_and_scans_once_without_interrupting_operations() {
+        use super::*;
+        let mut m = Model::new();
+        m.navigate(Page::Network);
+        assert!(m.wifi_scan_pending); // Initial state is not yet known.
+        assert!(!m.scan_wifi_on_entry());
+        m.common.wifi = Some(true);
+        assert!(m.scan_wifi_on_entry());
+        assert!(!m.scan_wifi_on_entry());
+        m.common.wifi = Some(false);
+        m.wifi_scan_pending = true;
+        assert!(!m.scan_wifi_on_entry());
+        assert!(!m.wifi_scan_pending);
+        m.common.wifi = Some(true);
+        m.busy = true;
+        m.hide();
+        m.navigate(Page::Network);
+        assert!(!m.wifi_scan_pending);
+        m.busy = false;
+        m.hide();
+        m.readonly = true;
+        m.navigate(Page::Network);
+        assert!(!m.wifi_scan_pending);
+        m.readonly = false;
+        m.common.wifi = None;
+        m.activate(Action::Tab("vpn".into()));
+        assert!(!m.wifi_scan_pending);
+        m.activate(Action::Tab("wifi".into()));
+        assert!(m.wifi_scan_pending);
+        m.hide();
+        m.common_state(control::State {
+            wifi: Some(true),
+            ..Default::default()
+        });
+        assert!(!m.wifi_scan_pending); // No delayed scan after dismissal.
+    }
+    #[test]
+    fn wifi_discovery_does_not_discard_an_unfinished_password() {
+        use super::*;
+        let mut m = Model::new();
+        m.wifi = Some(net::Ap {
+            active: false,
+            bssid: "00:11:22:33:44:55".into(),
+            ssid: "Fixture".into(),
+            signal: 70,
+            security: "WPA2".into(),
+            device: "test0".into(),
+        });
+        m.secret = "unfinished-test-secret".into();
+        m.cursor = m.secret.len();
+        m.entry = true;
+        m.busy = true;
+        m.scanning = true;
+        m.network_event(net::Event::Finished(Ok(())));
+        assert!(!m.busy);
+        assert!(!m.scanning);
+        assert!(m.wifi.is_some());
+        assert!(m.entry);
+        assert_eq!(m.secret, "unfinished-test-secret");
+    }
+    #[test]
+    fn tab_wheel_accumulates_fine_input_and_stops_at_the_ends() {
+        use super::*;
+        let mut m = Model::new();
+        m.hits.insert(
+            1,
+            ["wifi", "ethernet", "vpn"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| Hit {
+                    rect: Rect {
+                        x: i as f64 * 100.0,
+                        y: 0.0,
+                        w: 100.0,
+                        h: 30.0,
+                    },
+                    action: Action::Tab(t.into()),
+                })
+                .collect(),
+        );
+        assert!(m.scroll_tabs(1, 50.0, 15.0, 5.0));
+        assert_eq!(m.tab, "wifi");
+        assert!(m.scroll_tabs(1, 50.0, 15.0, 10.0));
+        assert_eq!(m.tab, "ethernet");
+        assert!(m.scroll_tabs(1, 50.0, 15.0, 15.0));
+        assert_eq!(m.tab, "vpn");
+        assert!(m.scroll_tabs(1, 50.0, 15.0, 15.0));
+        assert_eq!(m.tab, "vpn");
+        assert!(m.scroll_tabs(1, 50.0, 15.0, -15.0));
+        assert_eq!(m.tab, "ethernet");
+        assert!(!m.scroll_tabs(1, 50.0, 100.0, 15.0));
+        assert!(!m.scroll_tabs(1, 50.0, 15.0, f64::NAN));
+    }
+    #[test]
+    fn body_segments_never_consume_wheel_or_change_settings() {
+        use super::*;
+        let mut m = Model::new();
+        let (tx, rx) = mpsc::channel();
+        m.power_tx = Some(tx);
+        m.common.profile = Some("balanced".into());
+        m.power.settings.ac_profile = "balanced".into();
+        m.hits.insert(
+            1,
+            power::PROFILES
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| Hit {
+                    rect: Rect {
+                        x: i as f64 * 100.0,
+                        y: 0.0,
+                        w: 100.0,
+                        h: 30.0,
+                    },
+                    action: Action::Power(power::Request::AutomaticProfile(true, p.into())),
+                })
+                .collect(),
+        );
+        assert!(!m.scroll_tabs(1, 50.0, 15.0, 15.0));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(m.common.profile.as_deref(), Some("balanced"));
+        m.hits.insert(
+            1,
+            vec![Hit {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 30.0,
+                },
+                action: Action::PowerSource(false),
+            }],
+        );
+        assert!(!m.scroll_tabs(1, 50.0, 15.0, -15.0));
+        assert!(m.power_ac);
+        m.hits.insert(
+            1,
+            power::PROFILES
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| Hit {
+                    rect: Rect {
+                        x: i as f64 * 100.0,
+                        y: 0.0,
+                        w: 100.0,
+                        h: 30.0,
+                    },
+                    action: Action::Power(power::Request::Profile(p.into())),
+                })
+                .collect(),
+        );
+        assert!(m.scroll_tabs(1, 50.0, 15.0, -15.0));
+        assert!(matches!(rx.try_recv().unwrap(),power::Request::Profile(p) if p=="power-saver"));
+    }
+    #[test]
+    fn power_disclosure_reverses_from_current_progress_instead_of_jumping() {
+        use super::*;
+        let mut m = Model::new();
+        assert_eq!(m.power_extra_progress(), 0.0);
+        m.activate(Action::PowerExtra);
+        assert!(m.power_extra_progress() < 0.01);
+        m.icon_values
+            .borrow_mut()
+            .get_mut("power-extra-open")
+            .unwrap()
+            .2 = Instant::now() - Duration::from_millis(120);
+        let mid = m.power_extra_progress();
+        assert!(mid > 0.0 && mid < 1.0);
+        assert!(m.animating());
+        m.activate(Action::PowerExtra);
+        assert!((m.power_extra_progress() - mid).abs() < 0.02);
+        m.icon_values
+            .borrow_mut()
+            .get_mut("power-extra-open")
+            .unwrap()
+            .2 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(m.power_extra_progress(), 0.0);
+    }
+    #[test]
+    fn bluetooth_pin_survives_hiding_without_overwriting_wifi_draft() {
+        use super::*;
+        let mut m = Model::new();
+        m.secret = "wifi-draft".into();
+        m.cursor = m.secret.len();
+        m.navigate(Page::Bluetooth);
+        let state = bt::State {
+            prompt: Some(bt::Prompt {
+                id: 1,
+                device: "test".into(),
+                kind: bt::PromptKind::Pin,
+            }),
+            ..bt::State::default()
+        };
+        m.bluetooth_state(state.clone());
+        m.insert("가12");
+        m.move_cursor(-1);
+        m.backspace();
+        assert_eq!(m.bt_input.value, "가2");
+        m.hide();
+        m.navigate(Page::Bluetooth);
+        m.visible = true;
+        m.bluetooth_state(state);
+        assert!(m.entry);
+        assert_eq!(m.bt_input.value, "가2");
+        assert_eq!(m.secret, "wifi-draft");
+        m.bluetooth_state(bt::State::default());
+        assert!(m.bt_input.value.is_empty());
+        assert!(!m.entry);
+    }
+    #[test]
+    fn bluetooth_state_wins_over_stale_common_backend_snapshot() {
+        use super::*;
+        let mut m = Model::new();
+        m.bluetooth_state(bt::State {
+            ready: true,
+            powered: true,
+            adapter: Some("adapter".into()),
+            devices: vec![bt::Device {
+                name: "Connected Device".into(),
+                connected: true,
+                ..bt::Device::default()
+            }],
+            ..bt::State::default()
+        });
+        m.common_state(control::State::default());
+        assert_eq!(m.common.bluetooth, Some(true));
+        assert_eq!(m.common.bluetooth_devices.as_slice(), ["Connected Device"]);
+    }
+    #[test]
+    fn deleting_a_notice_tracks_its_exit_and_rejects_stale_backend_rows() {
+        use super::*;
+        let mut m = Model::new();
+        m.notifications.notices.push(crate::notifications::Notice {
+            id: 41,
+            app: "Fixture".into(),
+            ..Default::default()
+        });
+        let old = m.notifications.clone();
+        m.hits.insert(
+            1,
+            vec![
+                Hit {
+                    rect: Rect {
+                        x: 332.0,
+                        y: 110.0,
+                        w: 428.0,
+                        h: 80.0,
+                    },
+                    action: Action::NoticeHover,
+                },
+                Hit {
+                    rect: Rect {
+                        x: 726.0,
+                        y: 117.0,
+                        w: 28.0,
+                        h: 28.0,
+                    },
+                    action: Action::DeleteNotices(vec![41]),
+                },
+            ],
+        );
+        m.activate(Action::DeleteNotices(vec![41]));
+        assert_eq!(m.notice_revision, 1);
+        let r = m.notice_exit.unwrap();
+        assert_eq!(r.y, 62.0, "a final card takes its app header with it");
+        assert!(r.h > 80.0);
+        m.notification_state(old);
+        assert!(m.notifications.notices.is_empty());
+        assert!(m.removed_notices.contains(&41));
+        m.notification_state(Default::default());
+        assert!(m.removed_notices.is_empty());
+    }
     #[test]
     fn calendar_reopens_at_current_month_without_old_wheel_delta() {
         let mut m = super::Model::new();

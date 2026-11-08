@@ -58,6 +58,7 @@ fn rows_from_json(value: serde_json::Value) -> BTreeMap<u32, Row> {
                     let val = match k.as_str() {
                         "id" => id.to_variant(),
                         "urgency" => (v.as_u64().unwrap_or(1) as u8).to_variant(),
+                        "received-at" => v.as_i64().filter(|t| *t > 0)?.to_variant(),
                         "actions" => serde_json::from_value::<HashMap<String, String>>(v.clone())
                             .ok()?
                             .to_variant(),
@@ -79,6 +80,8 @@ fn cache(s: &State) {
             row.iter()
                 .map(|(k, v)| {
                     let val = if let Some(v) = v.get::<String>() {
+                        serde_json::json!(v)
+                    } else if let Some(v) = v.get::<i64>() {
                         serde_json::json!(v)
                     } else if let Some(v) = v.get::<u32>() {
                         serde_json::json!(v)
@@ -148,13 +151,15 @@ fn close(s: &mut State, id: u32, reason: u32, history: bool) {
         if history && !entry.transient {
             s.history.insert(id, entry.row);
         }
-        let _ = s.bus.emit_signal(
-            None,
-            "/org/freedesktop/Notifications",
-            NAME,
-            "NotificationClosed",
-            Some(&(id, reason).to_variant()),
-        );
+        if !entry.sender.is_empty() {
+            let _ = s.bus.emit_signal(
+                None,
+                "/org/freedesktop/Notifications",
+                NAME,
+                "NotificationClosed",
+                Some(&(id, reason).to_variant()),
+            );
+        }
     }
     if !history {
         s.history.remove(&id);
@@ -172,6 +177,42 @@ pub struct Server {
     state: Arc<Mutex<State>>,
 }
 impl Server {
+    pub fn low_battery(&self, percent: u32) {
+        let mut s = self.state.lock().unwrap();
+        let id = s.next;
+        s.next = s.next.wrapping_add(1).max(1000);
+        let row = HashMap::from([
+            ("id".into(), id.to_variant()),
+            (
+                "received-at".into(),
+                (glib::real_time() / 1_000_000).to_variant(),
+            ),
+            ("app-name".into(), "Lucy".to_variant()),
+            ("app-icon".into(), "battery-caution-symbolic".to_variant()),
+            ("summary".into(), "배터리 부족".to_variant()),
+            (
+                "body".into(),
+                format!("배터리가 {percent}% 남았습니다. 충전기를 연결해 주세요.").to_variant(),
+            ),
+            ("category".into(), "device.battery".to_variant()),
+            ("urgency".into(), 2u8.to_variant()),
+            ("desktop-entry".into(), "lucy-shell".to_variant()),
+            (
+                "actions".into(),
+                HashMap::<String, String>::new().to_variant(),
+            ),
+        ]);
+        s.live.insert(
+            id,
+            Entry {
+                row,
+                sender: String::new(),
+                timer: None,
+                transient: false,
+            },
+        );
+        publish(&s);
+    }
     #[allow(deprecated)]
     pub fn start(tx: glib::Sender<Vec<super::notifications::Notice>>) -> Result<Self, glib::Error> {
         let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
@@ -280,9 +321,9 @@ impl Server {
                         if let Some(mut old)=s.live.remove(&id){if let Some(timer)=old.timer.take(){timer.remove();}}
                         let urgency=hints.get("urgency").and_then(|v|v.get::<u8>()).unwrap_or(1);
                         let category=hints.get("category").and_then(|v|v.get::<String>()).unwrap_or_default();
-                        let suppress=app=="poweralertd" && category=="power.update" && ["Battery pending charge","Battery charging","Battery fully charged"].iter().any(|p|body.starts_with(p));
+                        let suppress=super::notifications::poweralert(&app);
                         let action_map:HashMap<String,String>=actions.chunks_exact(2).map(|p|(p[0].clone(),p[1].clone())).collect();
-                        let row=HashMap::from([("id".into(),id.to_variant()),("app-name".into(),app.to_variant()),("app-icon".into(),icon.to_variant()),("summary".into(),summary.to_variant()),("body".into(),body.to_variant()),("category".into(),category.to_variant()),("urgency".into(),urgency.to_variant()),("desktop-entry".into(),hints.get("desktop-entry").cloned().unwrap_or_else(||"".to_variant())),("actions".into(),action_map.to_variant())]);
+                        let row=HashMap::from([("id".into(),id.to_variant()),("received-at".into(),(glib::real_time()/1_000_000).to_variant()),("app-name".into(),app.to_variant()),("app-icon".into(),icon.to_variant()),("summary".into(),summary.to_variant()),("body".into(),body.to_variant()),("category".into(),category.to_variant()),("urgency".into(),urgency.to_variant()),("desktop-entry".into(),hints.get("desktop-entry").cloned().unwrap_or_else(||"".to_variant())),("actions".into(),action_map.to_variant())]);
                         let expire=if timeout<0 {if urgency==2 {0}else{6000}}else{timeout};
                         if !suppress {
                             let timer=if expire>0 {let weak=Arc::downgrade(&shared);Some(glib::timeout_add_local_once(std::time::Duration::from_millis(expire as u64),move||{if let Some(state)=weak.upgrade(){let mut s=state.lock().unwrap();if let Some(e)=s.live.get_mut(&id){e.timer=None;}close(&mut s,id,1,true);}}))}else{None};
@@ -438,6 +479,42 @@ pub fn self_test() -> Result<(), Box<dyn std::error::Error>> {
                 .get::<Vec<Row>>()
                 .unwrap();
             assert_eq!(live.len(), 1);
+            let received = live[0]["received-at"]
+                .get::<i64>()
+                .ok_or("Missing receipt timestamp")?;
+            assert!((glib::real_time() / 1_000_000 - received).abs() <= 2);
+            for category in [
+                "power.online",
+                "power.offline",
+                "power.update",
+                "power.low",
+                "power.critical",
+            ] {
+                call(
+                    "Notify",
+                    Some(
+                        &(
+                            "poweralertd",
+                            0u32,
+                            "battery",
+                            "Power status",
+                            "Current level: 80%",
+                            Vec::<String>::new(),
+                            HashMap::from([("category".to_owned(), category.to_variant())]),
+                            0i32,
+                        )
+                            .to_variant(),
+                    ),
+                )?;
+            }
+            assert_eq!(
+                call("ListNotifications", None)?
+                    .child_value(0)
+                    .get::<Vec<Row>>()
+                    .unwrap()
+                    .len(),
+                1
+            );
             call(
                 "SetModes",
                 Some(&(vec!["default", "do-not-disturb"],).to_variant()),
@@ -503,13 +580,35 @@ pub fn self_test() -> Result<(), Box<dyn std::error::Error>> {
         let _ = done.send(r);
     });
     loop_.run();
+    server.low_battery(19);
+    {
+        let mut s = server.state.lock().unwrap();
+        let id = *s
+            .live
+            .keys()
+            .next()
+            .ok_or("Missing native low-battery warning")?;
+        let row = &s.live[&id].row;
+        assert_eq!(row["app-name"].get::<String>().as_deref(), Some("Lucy"));
+        assert!(row["body"].get::<String>().unwrap().contains("19%"));
+        assert_eq!(row["urgency"].get::<u8>(), Some(2));
+        close(&mut s, id, 2, false);
+    }
     drop(server);
+    let cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cache_path().ok_or("No cache path")?)?)?;
+    let restored = rows_from_json(cached["history"].clone());
+    assert!(!restored.is_empty());
+    assert!(restored.values().all(|row| row
+        .get("received-at")
+        .and_then(|v| v.get::<i64>())
+        .is_some_and(|t| t > 0)));
     let r = result
         .borrow_mut()
         .take()
         .ok_or("No notification test result")?;
     r.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    println!("PASS: isolated Lucy notification service, replacement IDs, DND, actions, real history deletion, expiration");
+    println!("PASS: isolated Lucy notification service, replacement IDs, DND, actions, history deletion, expiration, receipt timestamps and cache restoration, poweralert suppression, native low-battery warning");
     Ok(())
 }
 
@@ -518,9 +617,11 @@ mod tests {
     #[test]
     fn cache_restores_notification_types() {
         let rows = super::rows_from_json(
-            serde_json::json!([{"id":1001,"app-name":"Test","body":"한글","urgency":2,"actions":{"default":"열기"}}]),
+            serde_json::json!([{"id":1001,"app-name":"Test","body":"한글","urgency":2,"received-at":1800000000,"actions":{"default":"열기"}},{"id":1002,"app-name":"Legacy"}]),
         );
         assert_eq!(rows[&1001]["urgency"].get::<u8>(), Some(2));
         assert_eq!(rows[&1001]["body"].get::<String>().as_deref(), Some("한글"));
+        assert_eq!(rows[&1001]["received-at"].get::<i64>(), Some(1_800_000_000));
+        assert!(!rows[&1002].contains_key("received-at"));
     }
 }

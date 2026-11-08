@@ -14,10 +14,10 @@ pub struct App {
     pub icon_name: String,
     pub icon: Option<Icon>,
 }
-pub const WIDTH: i32 = 540;
-pub const HEIGHT: i32 = 560;
-pub const ROW_HEIGHT: f64 = 104.0;
-pub const CELL_WIDTH: f64 = 100.0;
+pub const WIDTH: i32 = 570;
+pub const HEIGHT: i32 = 465; // Three full rows, then half of the fourth row's icons.
+pub const ROW_HEIGHT: f64 = 110.0;
+pub const CELL_WIDTH: f64 = 106.0;
 #[derive(Default)]
 pub struct Launcher {
     pub apps: Vec<App>,
@@ -26,6 +26,7 @@ pub struct Launcher {
     pub cursor: usize,
     pub selected_all: bool,
     pub selected: usize,
+    pub keyboard_focus: bool,
     pub usage: HashMap<String, u64>,
 }
 fn usage_path() -> Option<PathBuf> {
@@ -40,6 +41,7 @@ impl Launcher {
         self.cursor = 0;
         self.selected_all = false;
         self.selected = 0;
+        self.keyboard_focus = false;
     }
     pub fn load_usage(&mut self) {
         self.usage = usage_path()
@@ -104,6 +106,7 @@ impl Launcher {
         self.query.insert_str(self.cursor, &value);
         self.cursor += value.len();
         self.selected = 0;
+        self.keyboard_focus = !self.query.is_empty();
     }
     pub fn backspace(&mut self) {
         if self.selected_all {
@@ -119,6 +122,7 @@ impl Launcher {
             self.cursor = start;
         }
         self.selected = 0;
+        self.keyboard_focus = !self.query.is_empty();
     }
     pub fn delete(&mut self) {
         if self.selected_all {
@@ -127,6 +131,7 @@ impl Launcher {
             self.query
                 .replace_range(self.cursor..self.cursor + c.len_utf8(), "");
             self.selected = 0;
+            self.keyboard_focus = !self.query.is_empty();
         }
     }
     pub fn move_cursor(&mut self, right: bool) {
@@ -144,6 +149,15 @@ impl Launcher {
         }
     }
     pub fn select(&mut self, delta: isize) {
+        if !self.keyboard_focus {
+            self.selected = if delta < 0 {
+                self.results().len().saturating_sub(1)
+            } else {
+                0
+            };
+            self.keyboard_focus = true;
+            return;
+        }
         self.selected = self
             .selected
             .saturating_add_signed(delta)
@@ -304,6 +318,20 @@ fn decode(path: &Path) -> Option<Icon> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_and_clearing_the_launcher_have_no_automatic_selection() {
+        let mut l = Launcher::default();
+        assert!(!l.keyboard_focus);
+        l.select(5);
+        assert!(l.keyboard_focus);
+        assert_eq!(l.selected, 0);
+        l.reset_search();
+        assert!(!l.keyboard_focus);
+        l.insert("a");
+        assert!(l.keyboard_focus);
+        l.backspace();
+        assert!(!l.keyboard_focus);
+    }
     #[test]
     fn frequency_then_name_and_search_are_deterministic() {
         let mut l = Launcher::default();

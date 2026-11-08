@@ -1,4 +1,5 @@
-//! NetworkManager frontend. Opening is read-only; mutations follow explicit clicks.
+//! NetworkManager frontend. Opening Wi-Fi requests discovery, never a connection
+//! or profile mutation. Connection/settings changes follow explicit clicks.
 //! nmcli --ask runs in a private PTY; secrets travel over its input, never argv/files.
 use std::{
     collections::{HashMap, HashSet},

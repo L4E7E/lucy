@@ -4,6 +4,33 @@ use cairo::Context;
 use gdk_pixbuf::prelude::*;
 use std::f64::consts::PI;
 
+/// Two continuous return arrows on a symmetric 24 px grid.
+pub fn refresh(cr: &Context, r: Rect, enabled: bool) {
+    let _ = cr.save();
+    // Match the spinner's 14 px ink diameter while retaining the 32 px hit box.
+    cr.translate(r.x + (r.w - 18.0) / 2.0, r.y + (r.h - 16.0) / 2.0);
+    cr.scale(0.75, 2.0 / 3.0);
+    cr.set_source_rgba(0.96, 0.97, 1.0, if enabled { 1.0 } else { 0.28 });
+    cr.set_line_width(2.4);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.new_path();
+    cr.move_to(20.0, 9.0);
+    cr.curve_to(18.6, 4.1, 12.8, 2.2, 8.3, 4.5);
+    cr.curve_to(6.2, 5.5, 4.7, 7.4, 4.1, 9.5);
+    cr.move_to(20.0, 4.0);
+    cr.line_to(20.0, 9.0);
+    cr.line_to(15.0, 9.0);
+    cr.move_to(4.0, 15.0);
+    cr.curve_to(5.4, 19.9, 11.2, 21.8, 15.7, 19.5);
+    cr.curve_to(17.8, 18.5, 19.3, 16.6, 19.9, 14.5);
+    cr.move_to(4.0, 20.0);
+    cr.line_to(4.0, 15.0);
+    cr.line_to(9.0, 15.0);
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
 fn logo_surface() -> Option<cairo::ImageSurface> {
     let loader = gdk_pixbuf::PixbufLoader::new();
     loader.set_size(64, 64);
@@ -85,7 +112,7 @@ pub fn battery(cr: &Context, font: &str, r: Rect, level: u32, charging: bool) {
     let body = Rect {
         x: r.x + 3.0,
         y: r.y + 8.5,
-        w: 30.0,
+        w: 34.0,
         h: 17.0,
     };
     draw::round(cr, body, 4.0);
@@ -124,29 +151,40 @@ pub fn battery(cr: &Context, font: &str, r: Rect, level: u32, charging: bool) {
         1.0,
     );
     let _ = cr.fill();
+    let number = if charging {
+        Rect {
+            x: body.x + 1.0,
+            w: body.w - 10.0,
+            ..body
+        }
+    } else {
+        body
+    };
     draw::text(
         cr,
         font,
         &level.to_string(),
-        body,
+        number,
         false,
         true,
         11.0,
         pango::Alignment::Center,
     );
     if charging {
-        // Keep the live number readable; place the charge bolt after the terminal.
+        // Reserve space after the live number, inside the battery outline.
         if draw::is_bar() {
             cr.set_source_rgb(0.96, 0.97, 1.0);
         } else {
             cr.set_source_rgb(1.0, 0.80, 0.40);
         }
-        cr.move_to(r.x + 42.0, r.y + 9.0);
-        cr.line_to(r.x + 38.5, r.y + 17.5);
-        cr.line_to(r.x + 41.0, r.y + 17.5);
-        cr.line_to(r.x + 39.5, r.y + 25.0);
-        cr.line_to(r.x + 44.0, r.y + 15.0);
-        cr.line_to(r.x + 41.5, r.y + 15.0);
+        let x = body.x + body.w - 8.0;
+        let y = body.y + 3.0;
+        cr.move_to(x + 3.5, y);
+        cr.line_to(x, y + 6.0);
+        cr.line_to(x + 2.5, y + 6.0);
+        cr.line_to(x + 1.0, y + 11.0);
+        cr.line_to(x + 5.0, y + 4.5);
+        cr.line_to(x + 2.5, y + 4.5);
         cr.close_path();
         let _ = cr.fill();
     }
@@ -301,6 +339,31 @@ pub fn status_colored(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, 
                 cr.line_to(12.0 + angle.cos() * 10.0, 12.0 + angle.sin() * 10.0);
             }
         }
+        "keyboard-backlight" => {
+            draw::round(
+                cr,
+                Rect {
+                    x: 1.5,
+                    y: 10.0,
+                    w: 21.0,
+                    h: 12.0,
+                },
+                2.0,
+            );
+            let _ = cr.stroke();
+            for y in [13.5, 16.5] {
+                for x in [5.0, 8.5, 12.0, 15.5, 19.0] {
+                    cr.move_to(x, y);
+                    cr.line_to(x + 0.15, y);
+                }
+            }
+            cr.move_to(7.0, 19.5);
+            cr.line_to(17.0, 19.5);
+            for (x, dx) in [(5.0, -2.0), (12.0, 0.0), (19.0, 2.0)] {
+                cr.move_to(x, 6.5);
+                cr.line_to(x + dx, 2.5);
+            }
+        }
         "audio" => {
             let waves = sound_waves(state);
             cr.move_to(3.0, 9.0);
@@ -360,6 +423,19 @@ pub fn status_colored(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, 
                     cr.line_to(15.0, 12.0);
                 }
             }
+        }
+        "vpn" => {
+            cr.move_to(12.0, 2.5);
+            cr.curve_to(9.5, 4.5, 6.0, 5.0, 3.5, 5.5);
+            cr.line_to(3.5, 11.0);
+            cr.curve_to(3.5, 16.0, 7.0, 19.5, 12.0, 22.0);
+            cr.curve_to(17.0, 19.5, 20.5, 16.0, 20.5, 11.0);
+            cr.line_to(20.5, 5.5);
+            cr.curve_to(18.0, 5.0, 14.5, 4.5, 12.0, 2.5);
+            cr.close_path();
+            cr.move_to(8.0, 11.5);
+            cr.line_to(11.0, 14.5);
+            cr.line_to(16.0, 9.0);
         }
         "lock" => {
             cr.arc(12.0, 9.0, 4.0, PI, 2.0 * PI);
@@ -575,6 +651,53 @@ pub fn sound_waves(state: &str) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn refresh_matches_loading_ring_ink_size_and_stays_centered() {
+        use super::*;
+        let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 32, 32).unwrap();
+        {
+            let cr = Context::new(&image).unwrap();
+            refresh(
+                &cr,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 32.0,
+                    h: 32.0,
+                },
+                true,
+            );
+        }
+        image.flush();
+        let stride = image.stride() as usize;
+        let pixels = image.data().unwrap();
+        let mut xs = vec![];
+        let mut ys = vec![];
+        for y in 0..32 {
+            for x in 0..32 {
+                if pixels[y * stride + x * 4 + 3] > 8 {
+                    xs.push(x);
+                    ys.push(y);
+                }
+            }
+        }
+        let (minx, maxx, miny, maxy) = (
+            *xs.iter().min().unwrap(),
+            *xs.iter().max().unwrap(),
+            *ys.iter().min().unwrap(),
+            *ys.iter().max().unwrap(),
+        );
+        assert!(
+            (13..=15).contains(&(maxx - minx + 1)),
+            "x bounds {minx}..{maxx}"
+        );
+        assert!(
+            (13..=15).contains(&(maxy - miny + 1)),
+            "y bounds {miny}..{maxy}"
+        );
+        assert!((minx + maxx).abs_diff(31) <= 1);
+        assert!((miny + maxy).abs_diff(31) <= 1);
+    }
+    #[test]
     fn profile_states_and_session_power_use_distinct_centered_vectors() {
         let render = |key, state| {
             let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 32, 32).unwrap();
@@ -625,7 +748,7 @@ mod tests {
     }
     #[test]
     fn charging_has_a_visible_bolt_without_replacing_the_number() {
-        let pixels = |charging| {
+        let pixels = |charging, level| {
             let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 48, 34).unwrap();
             {
                 let cr = Context::new(&image).unwrap();
@@ -638,20 +761,31 @@ mod tests {
                         w: 44.0,
                         h: 34.0,
                     },
-                    68,
+                    level,
                     charging,
                 );
             }
             image.flush();
             let stride = image.stride() as usize;
             let data = image.data().unwrap();
-            (9..26)
-                .flat_map(|y| (39..44).map(move |x| y * stride + x * 4 + 3))
-                .map(|i| u32::from(data[i]))
-                .sum::<u32>()
+            let ink = |left: usize, right: usize| {
+                (10..24)
+                    .flat_map(|y| (left..right).map(move |x| y * stride + x * 4 + 3))
+                    .map(|i| u32::from(data[i]))
+                    .sum::<u32>()
+            };
+            // Number on the left, bolt on the right; nothing beyond the terminal.
+            (ink(7, 27), ink(29, 34), ink(43, 48))
         };
-        assert_eq!(pixels(false), 0);
-        assert!(pixels(true) > 1000);
+        for level in [0, 9, 68, 100] {
+            let (number, bolt, outside) = pixels(true, level);
+            assert!(number > 1000, "number {level} must remain visible");
+            assert!(
+                bolt > pixels(false, level).1 + 1000,
+                "bolt must be inside the body"
+            );
+            assert_eq!(outside, 0);
+        }
     }
     #[test]
     fn expanded_and_collapsed_chevrons_have_identical_bounds() {

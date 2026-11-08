@@ -80,6 +80,12 @@ impl Keyboard {
         }
     }
     pub fn key(&self, key: u32) -> (u32, String, bool) {
+        self.key_inner(key, false)
+    }
+    pub fn private_key(&self, key: u32) -> (u32, String, bool) {
+        self.key_inner(key, true)
+    }
+    fn key_inner(&self, key: u32, private: bool) -> (u32, String, bool) {
         if self.state.is_null() {
             return (0, String::new(), false);
         }
@@ -90,11 +96,22 @@ impl Keyboard {
             let n =
                 xkb_state_key_get_utf8(self.state, code, buffer.as_mut_ptr().cast(), buffer.len());
             let ctrl = xkb_state_mod_name_is_active(self.state, c"Control".as_ptr(), 1 << 3) > 0;
-            (
+            let result = (
                 sym,
                 String::from_utf8_lossy(&buffer[..(n.max(0) as usize).min(127)]).into_owned(),
                 ctrl,
-            )
+            );
+            if private {
+                libc::explicit_bzero(buffer.as_mut_ptr().cast(), buffer.len());
+            }
+            result
+        }
+    }
+    pub fn symbol(&self, key: u32) -> u32 {
+        if self.state.is_null() {
+            0
+        } else {
+            unsafe { xkb_state_key_get_one_sym(self.state, key + 8) }
         }
     }
 }

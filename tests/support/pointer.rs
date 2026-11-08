@@ -141,4 +141,34 @@ impl Pointer {
         self.queue.roundtrip(&mut self.state).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
+    #[allow(dead_code)]
+    pub fn drag(&mut self, x: f64, y: f64, dx: f64, dy: f64) {
+        self.device.motion_absolute(
+            1,
+            x.round() as u32,
+            y.round() as u32,
+            self.width as u32,
+            self.height as u32,
+        );
+        self.device.button(2, 0x110, ButtonState::Pressed);
+        self.device.frame();
+        self.queue.roundtrip(&mut self.state).unwrap();
+        thread::sleep(Duration::from_millis(80));
+        for i in 1..=8 {
+            self.device.motion_absolute(
+                3,
+                (x + dx * f64::from(i) / 8.0).round() as u32,
+                (y + dy * f64::from(i) / 8.0).round() as u32,
+                self.width as u32,
+                self.height as u32,
+            );
+            self.device.frame();
+            self.queue.roundtrip(&mut self.state).unwrap();
+            thread::sleep(Duration::from_millis(25));
+        }
+        self.device.button(4, 0x110, ButtonState::Released);
+        self.device.frame();
+        self.queue.roundtrip(&mut self.state).unwrap();
+        thread::sleep(Duration::from_millis(250));
+    }
 }

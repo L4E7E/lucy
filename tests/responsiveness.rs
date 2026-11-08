@@ -69,13 +69,13 @@ fn idle_reopen_advances_without_unrelated_input() {
         assert!(Instant::now() < deadline, "preview failed to start");
         thread::sleep(Duration::from_millis(10));
     }
-    let mut buffer = [0; 2048];
+    let mut buffer = [0; 16384];
     socket
         .recv(&mut buffer)
         .expect("preview event loop failed to answer");
     let status = || {
         socket.send_to(b"@status", &server).unwrap();
-        let mut bytes = [0; 2048];
+        let mut bytes = [0; 16384];
         let n = socket.recv(&mut bytes).expect("UI event loop stalled");
         serde_json::from_slice::<serde_json::Value>(&bytes[..n]).unwrap()
     };
@@ -98,7 +98,7 @@ fn idle_reopen_advances_without_unrelated_input() {
         }
         let latency = start.elapsed();
         // Do not inject mouse/key/repaint events while awaiting animation progress.
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(560));
         let s = status();
         assert_eq!(
             s["size"],
@@ -113,4 +113,26 @@ fn idle_reopen_advances_without_unrelated_input() {
         }
         println!("reopen {cycle}: first frame {latency:?}");
     }
+    socket.send_to(b"launcher", &server).unwrap();
+    let opening = status();
+    assert_eq!(opening["page"], "launcher");
+    assert!(
+        opening["size"][0].as_i64().unwrap() >= 530,
+        "launcher must not spring open from a tiny surface: {opening}"
+    );
+    let mut widths = std::collections::BTreeSet::new();
+    widths.insert(opening["size"][0].as_i64().unwrap());
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(20));
+        widths.insert(status()["size"][0].as_i64().unwrap());
+    }
+    assert!(
+        widths.len() >= 3,
+        "launcher must actually animate through multiple sizes: {widths:?}"
+    );
+    let launcher = status();
+    assert_eq!(launcher["page"], "launcher");
+    assert_eq!(launcher["size"], serde_json::json!([570, 465]));
+    assert_eq!(launcher["launcher_focus"], false);
+    println!("launcher: five columns, three full rows and half of the fourth");
 }

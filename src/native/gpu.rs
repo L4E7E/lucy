@@ -37,7 +37,23 @@ pub enum Effect {
     Open,
     Change,
     Slide,
+    SlideBack,
+    CalendarNext,
+    CalendarPrevious,
+    NoticeExit,
     Close,
+}
+impl Effect {
+    pub fn slide_direction(self) -> f32 {
+        match self {
+            Self::Slide => 1.0,
+            Self::SlideBack => -1.0,
+            _ => 0.0,
+        }
+    }
+    fn is_slide(self) -> bool {
+        self.slide_direction() != 0.0
+    }
 }
 pub fn spring(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -45,6 +61,34 @@ pub fn spring(t: f32) -> f32 {
         1.0
     } else {
         1.0 - (-10.0 * t).exp() * ((10.0 * t).cos() + (10.0 * t).sin())
+    }
+}
+pub fn indicator_shape(from: f32, to: f32, t: f32) -> [f32; 4] {
+    if (from - to).abs() < 0.01 {
+        return [to, to, 0.0, 5.0];
+    }
+    let t = t.clamp(0.0, 1.0);
+    let smooth = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let wave = (std::f32::consts::PI * t).sin().max(0.0);
+    [
+        from + (to - from) * smooth(t),
+        from + (to - from) * smooth(t.powf(1.7)),
+        3.5 * wave,
+        5.0 - 0.7 * wave,
+    ]
+}
+struct Indicator {
+    from: f32,
+    to: f32,
+    start: Instant,
+    last: Cell<f32>,
+}
+impl Indicator {
+    fn time(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() / 0.36).min(1.0)
+    }
+    fn animating(&self) -> bool {
+        (self.from - self.to).abs() > 0.01 && (self.time() < 1.0 || self.last.get() < 1.0)
     }
 }
 pub fn geometry(effect: Effect, t: f32, notice: bool) -> (f32, f32) {
@@ -64,6 +108,20 @@ pub fn geometry(effect: Effect, t: f32, notice: bool) -> (f32, f32) {
         ((0.08 + 0.92 * p).max(0.08), -8.0 * (1.0 - p))
     }
 }
+pub fn launcher_geometry(effect: Effect, t: f32) -> (f32, f32) {
+    if !matches!(effect, Effect::Open | Effect::Close) {
+        return (1.0, 0.0);
+    }
+    let p = super::expansion::relaxed(t);
+    let amount = if effect == Effect::Close { 1.0 - p } else { p };
+    // Surface geometry also drives the compositor's blur mask, so neither
+    // the material nor its blur gets left behind during the bounded zoom.
+    (0.94 + 0.06 * amount, 12.0 * (1.0 - amount))
+}
+fn shimmer_position(seconds: f32) -> f32 {
+    let phase = (seconds.rem_euclid(1.95) / 1.4).min(1.0);
+    -0.28 + 1.56 * phase
+}
 struct Program {
     native: glow::NativeProgram,
     vertices: glow::NativeBuffer,
@@ -78,6 +136,21 @@ struct Program {
     extent: Option<glow::NativeUniformLocation>,
     header_rect: Option<glow::NativeUniformLocation>,
     header_image: Option<glow::NativeUniformLocation>,
+    header_fade: Option<glow::NativeUniformLocation>,
+    motion_mode: Option<glow::NativeUniformLocation>,
+    motion_rect: Option<glow::NativeUniformLocation>,
+    list_rect: Option<glow::NativeUniformLocation>,
+    reflow: Option<glow::NativeUniformLocation>,
+    calendar_prev: Option<glow::NativeUniformLocation>,
+    calendar_next: Option<glow::NativeUniformLocation>,
+    indicator: Option<glow::NativeUniformLocation>,
+    logical_size: Option<glow::NativeUniformLocation>,
+    shimmer_rect: Option<glow::NativeUniformLocation>,
+    shimmer_position: Option<glow::NativeUniformLocation>,
+    corner_radius: Option<glow::NativeUniformLocation>,
+    lock_sharp: Option<glow::NativeUniformLocation>,
+    lock_amount: Option<glow::NativeUniformLocation>,
+    lock_texel: Option<glow::NativeUniformLocation>,
 }
 pub struct Gpu {
     display: Handle,
@@ -147,11 +220,16 @@ impl Gpu {
         {
             return Err("Software GL; choosing SHM fallback".into());
         }
-        let vert="attribute vec2 position; varying vec2 uv; void main(){uv=vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5);gl_Position=vec4(position,0.0,1.0);}";
+        let vert="precision highp float; attribute vec2 position; varying highp vec2 uv; void main(){uv=vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5);gl_Position=vec4(position,0.0,1.0);}";
         // Keep a stationary material under independently animated foreground content.
         // Niri owns blur; full-window motion is applied to wl_surface geometry, not this quad.
-        let frag = r#"precision mediump float;
-varying vec2 uv;
+        // A mediump UV loses subpixel precision on large physical buffers.
+        // That destroys already antialiased glyph edges, particularly in the
+        // right-hand notification column. Keep locals, parameters and samplers
+        // highp too, not just the varying. Unsupported GPUs retain SHM fallback.
+        let frag = r#"precision highp float;
+precision highp sampler2D;
+varying highp vec2 uv;
 uniform sampler2D currentImage;
 uniform sampler2D previousImage;
 uniform vec4 ratios;
@@ -163,6 +241,44 @@ uniform float joined;
 uniform vec4 extent;
 uniform vec4 headerRect;
 uniform sampler2D headerImage;
+uniform float headerFade;
+uniform float motionMode;
+uniform vec4 motionRect;
+uniform vec4 listRect;
+uniform float reflow;
+uniform vec4 calendarPrev;
+uniform vec4 calendarNext;
+uniform vec4 indicator;
+uniform vec2 logicalSize;
+uniform vec4 shimmerRect;
+uniform float shimmerPosition;
+uniform float cornerRadius;
+uniform sampler2D lockSharp;
+uniform float lockAmount;
+uniform vec2 lockTexel;
+vec4 illuminate(vec4 scene, vec2 q){
+    if(shimmerRect.z<=0.0)return scene;
+    vec2 local=(q-shimmerRect.xy)/shimmerRect.zw;
+    if(local.x<0.0||local.x>1.0||local.y<0.0||local.y>1.0)return scene;
+    float mask=texture2D(headerImage,local).a;
+    // One finite beam leaves completely before re-entering from the left.
+    // A wide, pure-white core is brighter without duplicating the highlight.
+    float beam=1.0-smoothstep(0.09,0.24,abs(local.x-shimmerPosition));
+    float a=mask*beam;
+    return vec4(vec3(a),a)+scene*(1.0-a);
+}
+vec4 decorate(vec4 scene,vec2 q){
+    if(indicator.w<0.5)return scene;
+    vec2 pos=q*logicalSize;
+    float d=length(pos-vec2(indicator.x,17.0))-indicator.w;
+    if(indicator.z>0.01){
+        float tail=length(pos-vec2(indicator.y,17.0))-indicator.z;
+        float h=clamp(0.5+0.5*(tail-d)/6.0,0.0,1.0);
+        d=mix(tail,d,h)-6.0*h*(1.0-h);
+    }
+    float a=1.0-smoothstep(-0.4,0.4,d);
+    return vec4(vec3(0.96,0.97,1.0)*a,a)+scene*(1.0-a);
+}
 vec4 sampleScene(sampler2D image,vec2 q,vec2 ratio){
     q=(q-vec2(1.0-ratio.x,0.0))/ratio;
     if(q.x<0.0||q.x>1.0||q.y<0.0||q.y>1.0)return vec4(0.0);
@@ -174,39 +290,88 @@ vec4 foreground(vec4 pixel){
     vec3 b=vec3(25.0,27.0,34.0)/255.0*backgroundAlpha;
     return vec4(max(vec3(0.0),pixel.rgb-b*(1.0-a)),a);
 }
+bool inside(vec2 q,vec4 r){return q.x>=r.x&&q.x<r.x+r.z&&q.y>=r.y&&q.y<r.y+r.w;}
+vec4 pageSlide(vec2 q){
+    float t=clamp(progress,0.0,1.0);
+    vec2 a=q+vec2(displacement*t,0.0);
+    vec2 b=q-vec2(displacement*(1.0-t),0.0);
+    bool incoming=displacement>0.0?q.x>=1.0-t:q.x<t;
+    // Exactly one page owns each pixel. No crossfade or fading text trails.
+    if(incoming)return sampleScene(currentImage,b,ratios.xy);
+    return sampleScene(previousImage,a,ratios.zw);
+}
+vec4 regional(vec2 q){
+    vec4 now=sampleScene(currentImage,q,ratios.xy);
+    if(abs(motionMode)<0.5)return now;
+    float t=clamp(progress,0.0,1.0);
+    if(abs(motionMode)<1.5){
+        if(!inside(q,motionRect))return now;
+        // Navigation buttons stay fixed, both on screen and in the sampled
+        // source scenes (otherwise a second ghost button would slide away).
+        if(inside(q,calendarPrev)||inside(q,calendarNext))return now;
+        vec2 a=q+vec2(0.0,motionMode*t*motionRect.w);
+        vec2 b=q-vec2(0.0,motionMode*(1.0-t)*motionRect.w);
+        vec4 old=inside(a,motionRect)&&!inside(a,calendarPrev)&&!inside(a,calendarNext)?sampleScene(previousImage,a,ratios.zw):vec4(0.0);
+        vec4 next=inside(b,motionRect)&&!inside(b,calendarPrev)&&!inside(b,calendarNext)?sampleScene(currentImage,b,ratios.xy):vec4(0.0);
+        return next+old*(1.0-next.a);
+    }
+    if(!inside(q,listRect))return now;
+    vec4 base=vec4(0.0);
+    vec2 lower=q+vec2(0.0,reflow*t);
+    if(q.y<motionRect.y)base=sampleScene(previousImage,q,ratios.zw);
+    else if(lower.y>=motionRect.y+motionRect.w&&inside(lower,listRect))base=sampleScene(previousImage,lower,ratios.zw);
+    // Reflowing rows already contain their text. Revealing the destination
+    // behind them too would briefly draw the same notification twice.
+    else base=abs(reflow)<0.001?now*t:vec4(0.0);
+    base=mix(base,now,smoothstep(0.90,1.0,t));
+    vec2 exiting=q+vec2(motionRect.z*t,0.0);
+    vec4 card=inside(exiting,motionRect)&&inside(exiting,listRect)?sampleScene(previousImage,exiting,ratios.zw)*(1.0-t):vec4(0.0);
+    return card+base*(1.0-card.a);
+}
 void main(){
+    if(lockAmount>=0.0){
+        vec4 locked=illuminate(regional(uv),uv);
+        if(lockAmount>=0.9999){gl_FragColor=locked;return;}
+        // Fixed-cost blur only during the short transition, never at idle.
+        vec2 d=lockTexel*(lockAmount*18.0);
+        vec4 desktop=texture2D(lockSharp,uv)*0.20;
+        desktop+=(texture2D(lockSharp,uv+vec2(d.x,0.0))+texture2D(lockSharp,uv-vec2(d.x,0.0))+texture2D(lockSharp,uv+vec2(0.0,d.y))+texture2D(lockSharp,uv-vec2(0.0,d.y)))*0.12;
+        desktop+=(texture2D(lockSharp,uv+d)+texture2D(lockSharp,uv-d)+texture2D(lockSharp,uv+vec2(d.x,-d.y))+texture2D(lockSharp,uv+vec2(-d.x,d.y)))*0.08;
+        gl_FragColor=mix(desktop.bgra,locked,lockAmount);return;
+    }
     if(joined>=0.0){
         vec2 pos=uv*extent.xy;
-        vec2 d=abs(pos-extent.xy*0.5)-(extent.xy*0.5-vec2(14.0));
-        float edge=length(max(d,vec2(0.0)))+min(max(d.x,d.y),0.0)-14.0;
+        float radius=min(cornerRadius,min(extent.x,extent.y)*0.5);
+        vec2 d=abs(pos-extent.xy*0.5)-(extent.xy*0.5-vec2(radius));
+        float edge=length(max(d,vec2(0.0)))+min(max(d.x,d.y),0.0)-radius;
         float mask=1.0-smoothstep(-0.7,0.3,edge);
         float light=mix(0.115,0.05,clamp(uv.y*1.5,0.0,1.0));
         vec4 base=vec4(vec3(25.0,27.0,34.0)/255.0*0.54,0.54);
         base=vec4(vec3(light),light)+base*(1.0-light);
         float rim=(1.0-smoothstep(0.4,1.3,abs(edge+0.9)))*mix(0.40,0.16,uv.y);
         base=vec4(vec3(rim),rim)+base*(1.0-rim);
-        vec2 q=(pos-vec2((extent.x-extent.z)*0.5,10.0*(1.0-joined)))/extent.zw;
-        vec4 body=sampleScene(currentImage,q,ratios.xy);
-        if(blending>0.5){
-            vec4 a=sampleScene(previousImage,q+vec2(displacement*progress,0.0),ratios.zw);
-            vec4 b=sampleScene(currentImage,q-vec2(displacement*(1.0-progress),0.0),ratios.xy);
-            body=mix(a,b,progress);
+        vec2 q=(pos-vec2((extent.x-extent.z)*0.5,extent.w<=34.0?0.0:10.0*(1.0-joined)))/extent.zw;
+        vec4 body=regional(q);
+        if(blending>0.5&&abs(motionMode)<0.5){
+            if(abs(displacement)>0.5)body=pageSlide(q);
+            else body=mix(sampleScene(previousImage,q,ratios.zw),body,progress);
         }
         body*=smoothstep(0.08,0.65,joined);
         vec4 result=body+base*(1.0-body.a);
         vec2 h=(pos-headerRect.xy)/headerRect.zw;
         if(h.x>=0.0&&h.x<=1.0&&h.y>=0.0&&h.y<=1.0){
-            vec4 ink=texture2D(headerImage,h).bgra;
+            vec4 ink=texture2D(headerImage,h).bgra*(1.0-headerFade*smoothstep(0.0,0.45,joined));
             result=ink+result*(1.0-ink.a);
         }
         gl_FragColor=result*mask;return;
     }
-    vec4 plain=sampleScene(currentImage,uv,ratios.xy);
-    if(blending<0.5){gl_FragColor=plain;return;}
+    vec4 plain=illuminate(regional(uv),uv);
+    if(abs(motionMode)>0.5){gl_FragColor=plain;return;}
+    if(blending<0.5){gl_FragColor=decorate(plain,uv);return;}
     float t=clamp(progress,0.0,1.0);
-    vec4 a=foreground(sampleScene(previousImage,uv+vec2(displacement*t,0.0),ratios.zw));
-    vec4 b=foreground(sampleScene(currentImage,uv-vec2(displacement*(1.0-t),0.0),ratios.xy));
-    vec4 content=mix(a,b,t);
+    vec4 content;
+    if(abs(displacement)>0.5)content=foreground(pageSlide(uv));
+    else content=mix(foreground(sampleScene(previousImage,uv,ratios.zw)),foreground(plain),t);
     float material=min(plain.a,backgroundAlpha);
     vec4 base=vec4(vec3(25.0,27.0,34.0)/255.0*material,material);
     gl_FragColor=content+base*(1.0-content.a);
@@ -252,6 +417,21 @@ void main(){
             extent: gl.get_uniform_location(native, "extent"),
             header_rect: gl.get_uniform_location(native, "headerRect"),
             header_image: gl.get_uniform_location(native, "headerImage"),
+            header_fade: gl.get_uniform_location(native, "headerFade"),
+            motion_mode: gl.get_uniform_location(native, "motionMode"),
+            motion_rect: gl.get_uniform_location(native, "motionRect"),
+            list_rect: gl.get_uniform_location(native, "listRect"),
+            reflow: gl.get_uniform_location(native, "reflow"),
+            calendar_prev: gl.get_uniform_location(native, "calendarPrev"),
+            calendar_next: gl.get_uniform_location(native, "calendarNext"),
+            indicator: gl.get_uniform_location(native, "indicator"),
+            logical_size: gl.get_uniform_location(native, "logicalSize"),
+            shimmer_rect: gl.get_uniform_location(native, "shimmerRect"),
+            shimmer_position: gl.get_uniform_location(native, "shimmerPosition"),
+            corner_radius: gl.get_uniform_location(native, "cornerRadius"),
+            lock_sharp: gl.get_uniform_location(native, "lockSharp"),
+            lock_amount: gl.get_uniform_location(native, "lockAmount"),
+            lock_texel: gl.get_uniform_location(native, "lockTexel"),
         };
         *self.program.borrow_mut() = Some(program);
         *self.gl.borrow_mut() = Some(gl);
@@ -278,6 +458,30 @@ struct Header {
     fingerprint: u64,
     width: f32,
 }
+struct LockBackdrop {
+    texture: glow::NativeTexture,
+    width: i32,
+    height: i32,
+    motion: LockMotion,
+}
+struct LockMotion {
+    from: f32,
+    to: f32,
+    start: Instant,
+    duration: Duration,
+    last: Cell<f32>,
+}
+impl LockMotion {
+    fn time(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
+    }
+    fn amount(&self) -> f32 {
+        self.from + (self.to - self.from) * super::expansion::relaxed(self.time())
+    }
+    fn active(&self) -> bool {
+        self.time() < 1.0 || self.last.get() < 1.0
+    }
+}
 pub struct Window {
     gpu: Rc<Gpu>,
     native: Handle,
@@ -293,9 +497,21 @@ pub struct Window {
     duration: Duration,
     last: Cell<f32>,
     active: bool,
+    launcher: bool,
+    lock_backdrop: Option<LockBackdrop>,
     background: f32,
     expansion: Option<super::expansion::Expansion>,
     header: Option<Header>,
+    osd: bool,
+    motion_rect: [f32; 4],
+    list_rect: [f32; 4],
+    reflow: f32,
+    calendar_prev: [f32; 4],
+    calendar_next: [f32; 4],
+    indicator: Option<Indicator>,
+    logical_size: (f32, f32),
+    shimmer: Option<[f32; 4]>,
+    shimmer_start: Instant,
 }
 impl Window {
     /// The caller keeps wl_surface alive until this wrapper is dropped.
@@ -353,9 +569,21 @@ impl Window {
             duration: Duration::from_millis(300),
             last: Cell::new(1.0),
             active: false,
+            launcher: false,
+            lock_backdrop: None,
             background: 0.8,
             expansion: None,
             header: None,
+            osd: false,
+            motion_rect: [0.0; 4],
+            list_rect: [0.0; 4],
+            reflow: 0.0,
+            calendar_prev: [0.0; 4],
+            calendar_next: [0.0; 4],
+            indicator: None,
+            logical_size: (w as f32, h as f32),
+            shimmer: None,
+            shimmer_start: Instant::now(),
         })
     }
     fn current(&self) -> bool {
@@ -371,12 +599,136 @@ impl Window {
     pub fn set_background(&mut self, alpha: f32) {
         self.background = alpha;
     }
-    pub fn begin_expansion(&mut self, source: i32, target: (i32, i32), calendar: bool) {
+    pub fn set_launcher(&mut self, launcher: bool) {
+        self.launcher = launcher;
+    }
+    pub fn set_lock_background(&mut self, bytes: &[u8], width: i32, height: i32) {
+        if self.lock_backdrop.is_some() || !self.current() {
+            return;
+        }
+        let gl = self.gpu.gl.borrow();
+        let Some(gl) = gl.as_ref() else { return };
+        unsafe {
+            let Ok(texture) = gl.create_texture() else {
+                return;
+            };
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            for (name, value) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
+            }
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                width,
+                height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(bytes)),
+            );
+            self.lock_backdrop = Some(LockBackdrop {
+                texture,
+                width,
+                height,
+                motion: LockMotion {
+                    from: 0.0,
+                    to: 1.0,
+                    start: Instant::now(),
+                    duration: Duration::from_millis(380),
+                    last: Cell::new(0.0),
+                },
+            });
+        }
+    }
+    pub fn lock_animating(&self) -> bool {
+        self.lock_backdrop
+            .as_ref()
+            .is_some_and(|b| b.motion.active())
+    }
+    #[cfg(test)]
+    pub fn lock_amount(&self) -> Option<f32> {
+        self.lock_backdrop.as_ref().map(|b| b.motion.amount())
+    }
+    pub fn release_lock(&mut self) {
+        if let Some(b) = &mut self.lock_backdrop {
+            b.motion.from = b.motion.amount();
+            b.motion.to = 0.0;
+            b.motion.start = Instant::now();
+            b.motion.duration = Duration::from_millis(300);
+            b.motion.last.set(0.0);
+        }
+    }
+    pub fn set_shimmer(&mut self, rect: Option<super::model::Rect>, size: (i32, i32)) {
+        self.shimmer = rect.filter(|_| self.header.is_some()).map(|r| {
+            [
+                (r.x / f64::from(size.0)) as f32,
+                (r.y / f64::from(size.1)) as f32,
+                (r.w / f64::from(size.0)) as f32,
+                (r.h / f64::from(size.1)) as f32,
+            ]
+        });
+    }
+    pub fn shimmer_active(&self) -> bool {
+        self.shimmer.is_some()
+    }
+    pub fn set_return_width(&mut self, width: i32) {
+        if let Some(expansion) = &mut self.expansion {
+            expansion.source = width.max(1) as f32;
+        }
+    }
+    pub fn set_osd(&mut self, osd: bool) {
+        self.osd = osd;
+    }
+    pub fn set_indicator(&mut self, target: Option<f32>, size: (i32, i32)) {
+        self.logical_size = (size.0 as f32, size.1 as f32);
+        let Some(to) = target else {
+            self.indicator = None;
+            return;
+        };
+        if let Some(marker) = &mut self.indicator {
+            if (marker.to - to).abs() > 0.01 {
+                marker.from = indicator_shape(marker.from, marker.to, marker.time())[0];
+                marker.to = to;
+                marker.start = Instant::now();
+                marker.last.set(0.0);
+            }
+        } else {
+            self.indicator = Some(Indicator {
+                from: to,
+                to,
+                start: Instant::now(),
+                last: Cell::new(1.0),
+            });
+        }
+    }
+    pub fn begin_expansion(
+        &mut self,
+        source: i32,
+        target: (i32, i32),
+        calendar: bool,
+        follow_width: bool,
+    ) {
         if self.expansion.is_none() {
-            self.expansion = Some(super::expansion::Expansion::new(source, target, calendar));
+            self.expansion = Some(super::expansion::Expansion::new(
+                source,
+                target,
+                calendar,
+                calendar || follow_width,
+            ));
         }
         if let Some(e) = &mut self.expansion {
-            e.target = target;
+            if follow_width && e.target.1 == target.1 {
+                e.follow_width(target.0);
+            } else {
+                e.retarget(target, self.header.as_ref().map_or(e.source, |h| h.width));
+            }
         }
     }
     pub fn expansion_frame(&self) -> Option<super::expansion::Frame> {
@@ -461,13 +813,65 @@ impl Window {
         }
         true
     }
-    pub fn update(&mut self, bytes: &[u8], w: i32, h: i32, effect: Effect) -> bool {
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        hash.write(bytes);
-        hash.write_i32(w);
-        hash.write_i32(h);
-        let hash = hash.finish();
-        if self.fingerprint == Some(hash) || !self.current() {
+    pub fn set_motion(&mut self, rect: super::model::Rect, size: (i32, i32), reflow: f64) {
+        let (w, h) = (size.0 as f64, size.1 as f64);
+        self.motion_rect = [
+            (rect.x / w) as f32,
+            (rect.y / h) as f32,
+            (rect.w / w) as f32,
+            (rect.h / h) as f32,
+        ];
+        self.list_rect = [
+            (super::notifications::LIST_X / w) as f32,
+            (62.0 / h) as f32,
+            ((f64::from(super::notifications::WIDTH) - super::notifications::LIST_X - 20.0) / w)
+                as f32,
+            ((h - 82.0) / h) as f32,
+        ];
+        self.reflow = (reflow / h) as f32;
+        self.calendar_prev = [
+            (18.0 / w) as f32,
+            ((62.0 + super::draw::CALENDAR_SHIFT) / h) as f32,
+            (40.0 / w) as f32,
+            (34.0 / h) as f32,
+        ];
+        self.calendar_next = [
+            (262.0 / w) as f32,
+            ((62.0 + super::draw::CALENDAR_SHIFT) / h) as f32,
+            (40.0 / w) as f32,
+            (34.0 / h) as f32,
+        ];
+    }
+    pub fn regional_animation(&self) -> bool {
+        matches!(
+            self.effect,
+            Effect::CalendarNext | Effect::CalendarPrevious | Effect::NoticeExit
+        ) && self.animating()
+    }
+    pub fn page_transition(&self) -> bool {
+        self.effect.is_slide() && self.animating()
+    }
+    pub fn effect(&self) -> Effect {
+        self.effect
+    }
+    pub fn update(
+        &mut self,
+        bytes: &[u8],
+        w: i32,
+        h: i32,
+        effect: Effect,
+        known_changed: bool,
+    ) -> bool {
+        let hash = if known_changed {
+            0
+        } else {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            hash.write(bytes);
+            hash.write_i32(w);
+            hash.write_i32(h);
+            hash.finish()
+        };
+        if (!known_changed && self.fingerprint == Some(hash)) || !self.current() {
             return false;
         }
         let first = self.fingerprint.is_none();
@@ -478,8 +882,17 @@ impl Window {
             self.w = w;
             self.h = h;
         }
-        let reset =
-            !self.animating() || matches!(effect, Effect::Slide | Effect::Immediate) || first;
+        let reset = !self.animating()
+            || matches!(
+                effect,
+                Effect::Slide
+                    | Effect::SlideBack
+                    | Effect::Immediate
+                    | Effect::CalendarNext
+                    | Effect::CalendarPrevious
+                    | Effect::NoticeExit
+            )
+            || first;
         if reset {
             self.front = 1 - self.front;
             self.effect = if first && effect != Effect::Immediate {
@@ -489,7 +902,17 @@ impl Window {
             };
             self.start = Instant::now();
             self.duration =
-                Duration::from_millis(if matches!(self.effect, Effect::Open | Effect::Slide) {
+                Duration::from_millis(if self.launcher && self.effect == Effect::Open {
+                    320
+                } else if self.effect.is_slide()
+                    || matches!(
+                        self.effect,
+                        Effect::Open
+                            | Effect::CalendarNext
+                            | Effect::CalendarPrevious
+                            | Effect::NoticeExit
+                    )
+                {
                     300
                 } else {
                     160
@@ -503,17 +926,31 @@ impl Window {
             unsafe {
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[index]));
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA as i32,
-                    w,
-                    h,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(bytes)),
-                );
+                if self.fingerprint.is_some() && self.sizes[index] == (w, h) {
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        w,
+                        h,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(bytes)),
+                    );
+                } else {
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA as i32,
+                        w,
+                        h,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(bytes)),
+                    );
+                }
             }
             self.sizes[index] = (w, h);
         }
@@ -527,7 +964,10 @@ impl Window {
         (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
     }
     pub fn animating(&self) -> bool {
-        self.expanding() || (self.active && (self.t() < 1.0 || self.last.get() < 1.0))
+        self.lock_animating()
+            || self.expanding()
+            || self.indicator.as_ref().is_some_and(Indicator::animating)
+            || (self.active && (self.t() < 1.0 || self.last.get() < 1.0))
     }
     pub fn closing(&self) -> bool {
         self.expansion
@@ -543,14 +983,29 @@ impl Window {
         }
         self.effect = Effect::Close;
         self.start = Instant::now();
-        self.duration = Duration::from_millis(190);
+        self.duration = Duration::from_millis(if self.launcher { 220 } else { 190 });
         self.last.set(0.0);
         self.active = true;
     }
     pub fn geometry(&self, notice: bool) -> (f32, f32) {
-        geometry(self.effect, self.t(), notice)
+        if self.launcher {
+            launcher_geometry(self.effect, self.t())
+        } else {
+            geometry(self.effect, self.t(), notice)
+        }
     }
     pub fn present(&self, expansion: Option<super::expansion::Frame>) -> bool {
+        self.present_frame(
+            expansion,
+            #[cfg(test)]
+            None,
+        )
+    }
+    fn present_frame(
+        &self,
+        expansion: Option<super::expansion::Frame>,
+        #[cfg(test)] inspect: Option<&mut dyn FnMut(&glow::Context, i32, i32)>,
+    ) -> bool {
         if !self.current() {
             return false;
         }
@@ -565,6 +1020,23 @@ impl Window {
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.disable(glow::BLEND);
             gl.use_program(Some(p.native));
+            gl.uniform_1_f32(p.corner_radius.as_ref(), super::draw::PANEL_RADIUS as f32);
+            let lock = self.lock_backdrop.as_ref();
+            gl.uniform_1_f32(
+                p.lock_amount.as_ref(),
+                lock.map_or(-1.0, |b| b.motion.amount()),
+            );
+            if let Some(b) = lock {
+                gl.active_texture(glow::TEXTURE3);
+                gl.bind_texture(glow::TEXTURE_2D, Some(b.texture));
+                gl.uniform_1_i32(p.lock_sharp.as_ref(), 3);
+                gl.uniform_2_f32(
+                    p.lock_texel.as_ref(),
+                    1.0 / b.width as f32,
+                    1.0 / b.height as f32,
+                );
+                b.motion.last.set(b.motion.time());
+            }
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.vertices));
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
@@ -574,6 +1046,84 @@ impl Window {
             }
             gl.uniform_1_i32(p.now.as_ref(), 0);
             gl.uniform_1_i32(p.old.as_ref(), 1);
+            let shine = self.shimmer.unwrap_or([0.0; 4]);
+            gl.uniform_4_f32(
+                p.shimmer_rect.as_ref(),
+                shine[0],
+                shine[1],
+                shine[2],
+                shine[3],
+            );
+            gl.uniform_1_f32(
+                p.shimmer_position.as_ref(),
+                shimmer_position(self.shimmer_start.elapsed().as_secs_f32()),
+            );
+            if self.shimmer.is_some() {
+                if let Some(header) = &self.header {
+                    gl.active_texture(glow::TEXTURE2);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(header.texture));
+                    gl.uniform_1_i32(p.header_image.as_ref(), 2);
+                }
+            }
+            gl.uniform_1_f32(p.header_fade.as_ref(), if self.osd { 1.0 } else { 0.0 });
+            let marker = self
+                .indicator
+                .as_ref()
+                .map_or([0.0; 4], |i| indicator_shape(i.from, i.to, i.time()));
+            gl.uniform_4_f32(
+                p.indicator.as_ref(),
+                marker[0],
+                marker[1],
+                marker[2],
+                marker[3],
+            );
+            gl.uniform_2_f32(
+                p.logical_size.as_ref(),
+                self.logical_size.0,
+                self.logical_size.1,
+            );
+            gl.uniform_1_f32(
+                p.motion_mode.as_ref(),
+                if t >= 1.0 {
+                    0.0
+                } else {
+                    match self.effect {
+                        Effect::CalendarNext => 1.0,
+                        Effect::CalendarPrevious => -1.0,
+                        Effect::NoticeExit => 2.0,
+                        _ => 0.0,
+                    }
+                },
+            );
+            gl.uniform_4_f32(
+                p.motion_rect.as_ref(),
+                self.motion_rect[0],
+                self.motion_rect[1],
+                self.motion_rect[2],
+                self.motion_rect[3],
+            );
+            gl.uniform_4_f32(
+                p.list_rect.as_ref(),
+                self.list_rect[0],
+                self.list_rect[1],
+                self.list_rect[2],
+                self.list_rect[3],
+            );
+            gl.uniform_1_f32(p.reflow.as_ref(), self.reflow);
+            gl.uniform_4_f32(
+                p.calendar_prev.as_ref(),
+                self.calendar_prev[0],
+                self.calendar_prev[1],
+                self.calendar_prev[2],
+                self.calendar_prev[3],
+            );
+            gl.uniform_4_f32(
+                p.calendar_next.as_ref(),
+                self.calendar_next[0],
+                self.calendar_next[1],
+                self.calendar_next[2],
+                self.calendar_next[3],
+            );
             gl.uniform_1_f32(p.joined.as_ref(), expansion.map_or(-1.0, |f| f.amount));
             if let (Some(f), Some(header)) = (expansion, &self.header) {
                 gl.active_texture(glow::TEXTURE2);
@@ -604,37 +1154,90 @@ impl Window {
                 b.0 as f32 / self.w as f32,
                 b.1 as f32 / self.h as f32,
             );
-            let progress = if self.effect == Effect::Slide {
-                spring(t).clamp(0.0, 1.0)
+            let progress = if self.effect.is_slide() {
+                super::expansion::relaxed(t)
             } else {
                 1.0 - (1.0 - t).powi(3)
             };
             gl.uniform_1_f32(p.progress.as_ref(), progress);
-            gl.uniform_1_f32(
-                p.displacement.as_ref(),
-                if self.effect == Effect::Slide {
-                    0.09
-                } else {
-                    0.0
-                },
-            );
+            gl.uniform_1_f32(p.displacement.as_ref(), self.effect.slide_direction());
             gl.uniform_1_f32(p.background.as_ref(), self.background);
             gl.uniform_1_f32(
                 p.blending.as_ref(),
-                if matches!(self.effect, Effect::Change | Effect::Slide) && t < 1.0 {
+                if (self.effect == Effect::Change || self.effect.is_slide()) && t < 1.0 {
                     1.0
                 } else {
                     0.0
                 },
             );
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            #[cfg(test)]
+            if let Some(inspect) = inspect {
+                inspect(gl, self.w, self.h);
+            }
             let ok = eglSwapBuffers(self.gpu.display, self.surface) != 0;
             self.last.set(t);
+            if let Some(indicator) = &self.indicator {
+                indicator.last.set(indicator.time());
+            }
             if let (Some(e), Some(f)) = (&self.expansion, expansion) {
                 e.presented(f.time);
             }
             ok
         }
+    }
+}
+#[cfg(test)]
+impl Window {
+    /// GPU readback is deliberately test-only: never retain a live lock raster.
+    pub fn verify_text_copy(&mut self, expected: &[u8], logical: (i32, i32)) {
+        let check = |window: &Self, frame, label| {
+            let mut max_error = 0u8;
+            let mut changed = 0usize;
+            let mut inspect = |gl: &glow::Context, w: i32, h: i32| {
+                let mut output = vec![0u8; (w * h * 4) as usize];
+                unsafe {
+                    gl.read_pixels(
+                        0,
+                        0,
+                        w,
+                        h,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut output)),
+                    );
+                }
+                assert_eq!(output.len(), expected.len());
+                // Joined surfaces have a rounded outer mask; test the content,
+                // including both halves of UV space, rather than that mask.
+                for y in 48..h as usize - 48 {
+                    for x in 48..w as usize - 48 {
+                        let a = (y * w as usize + x) * 4;
+                        let b = ((h as usize - 1 - y) * w as usize + x) * 4;
+                        for (source, channel) in [2, 1, 0, 3].into_iter().enumerate() {
+                            let error = expected[a + source].abs_diff(output[b + channel]);
+                            max_error = max_error.max(error);
+                            changed += usize::from(error > 1);
+                        }
+                    }
+                }
+            };
+            assert!(window.present_frame(frame, Some(&mut inspect)));
+            assert_eq!(
+                changed, 0,
+                "{label}: GPU lost coverage in {changed} channels, max error {max_error}"
+            );
+            println!(
+                "{label}: {}x{} physical pixels, max channel error {max_error}",
+                window.w, window.h
+            );
+        };
+        check(self, None, "lock copy");
+        assert!(self.set_header(&[0; 4], 1, 1, 1.0));
+        self.begin_expansion(logical.0, logical, false, false);
+        let frame = super::expansion::layout(1.0, logical.0 as f32, logical, 1.0, false);
+        check(self, Some(frame), "notification joined copy");
+        self.finish_expansion();
     }
 }
 impl Drop for Window {
@@ -648,6 +1251,9 @@ impl Drop for Window {
                 if let Some(h) = &self.header {
                     gl.delete_texture(h.texture);
                 }
+                if let Some(b) = &self.lock_backdrop {
+                    gl.delete_texture(b.texture);
+                }
             }
             eglDestroySurface(self.gpu.display, self.surface);
             wl_egl_window_destroy(self.native);
@@ -656,6 +1262,56 @@ impl Drop for Window {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launcher_opens_without_bounce_or_extreme_scaling() {
+        use super::*;
+        let (mut last_scale, mut last_y) = (0.94, 12.0);
+        for i in 0..=100 {
+            let (scale, y) = launcher_geometry(Effect::Open, i as f32 / 100.0);
+            assert!((0.94..=1.0).contains(&scale));
+            assert!((0.0..=12.0).contains(&y));
+            assert!(scale >= last_scale && y <= last_y);
+            last_scale = scale;
+            last_y = y;
+        }
+        assert_eq!(launcher_geometry(Effect::Open, 1.0), (1.0, 0.0));
+        assert_eq!(launcher_geometry(Effect::Close, 1.0), (0.94, 12.0));
+    }
+    #[test]
+    fn placeholder_light_makes_one_left_to_right_pass_then_reenters_offscreen() {
+        assert!((super::shimmer_position(0.0) + 0.28).abs() < 0.001);
+        for step in 1..140 {
+            let previous = super::shimmer_position((step - 1) as f32 * 0.01);
+            let next = super::shimmer_position(step as f32 * 0.01);
+            assert!(next > previous);
+            assert!((next - previous - 1.56 * 0.01 / 1.4).abs() < 0.0001);
+        }
+        assert!((super::shimmer_position(0.7) - 0.5).abs() < 0.001);
+        assert!((super::shimmer_position(2.65) - 0.5).abs() < 0.001);
+        assert!((super::shimmer_position(3.9) - super::shimmer_position(0.0)).abs() < 0.001);
+        // The compact beam has radius 0.24: both ends are dark at the reset.
+        assert!(super::shimmer_position(0.0) < -0.24);
+        assert!(super::shimmer_position(1.399) > 1.24);
+        for time in [1.4, 1.6, 1.94] {
+            assert!((super::shimmer_position(time) - 1.28).abs() < 0.001);
+        }
+    }
+    #[test]
+    fn liquid_indicator_travels_without_jumping_and_settles_as_a_circle() {
+        use super::indicator_shape;
+        assert_eq!(indicator_shape(58.0, 90.0, 0.0), [58.0, 58.0, 0.0, 5.0]);
+        let end = indicator_shape(58.0, 90.0, 1.0);
+        assert_eq!((end[0], end[1], end[3]), (90.0, 90.0, 5.0));
+        assert!(end[2] < 0.0001);
+        let middle = indicator_shape(58.0, 90.0, 0.5);
+        assert!(middle[0] > middle[1] && middle[0] < 90.0 && middle[2] > 3.0);
+        let mut last = 58.0;
+        for step in 0..=100 {
+            let shape = indicator_shape(58.0, 90.0, step as f32 / 100.0);
+            assert!(shape[0] >= last - 0.0001 && shape[0] <= 90.0001);
+            last = shape[0];
+        }
+    }
     #[test]
     fn spring_settles_and_has_only_small_overshoot() {
         assert_eq!(super::spring(0.0), 0.0);
@@ -676,6 +1332,23 @@ mod tests {
         // Even the smallest panel stays wider than two 11.25px corner radii.
         assert!(start * 340.0 > 22.5);
         assert_eq!(geometry(Effect::Slide, 0.5, false), (1.0, 0.0));
+        assert_eq!(geometry(Effect::SlideBack, 0.5, false), (1.0, 0.0));
         assert_eq!(geometry(Effect::Open, 0.0, true).1, -1.0);
+    }
+    #[test]
+    fn navigation_pushes_one_full_page_and_reverses_when_going_back() {
+        use super::Effect;
+        for (effect, direction) in [(Effect::Slide, 1.0), (Effect::SlideBack, -1.0)] {
+            assert!(effect.is_slide());
+            assert_eq!(effect.slide_direction(), direction);
+            for step in 0..=100 {
+                let progress = super::super::expansion::relaxed(step as f32 / 100.0);
+                let outgoing = -direction * progress;
+                let incoming = direction * (1.0 - progress);
+                assert!(((incoming - outgoing).abs() - 1.0).abs() < 0.00001);
+            }
+        }
+        assert!(!Effect::Change.is_slide());
+        assert_eq!(Effect::Change.slide_direction(), 0.0);
     }
 }
