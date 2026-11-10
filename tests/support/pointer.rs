@@ -143,6 +143,10 @@ impl Pointer {
     }
     #[allow(dead_code)]
     pub fn drag(&mut self, x: f64, y: f64, dx: f64, dy: f64) {
+        self.drag_with_preview(x, y, dx, dy, || {});
+    }
+    #[allow(dead_code)]
+    pub fn drag_with_preview(&mut self, x: f64, y: f64, dx: f64, dy: f64, preview: impl FnOnce()) {
         self.device.motion_absolute(
             1,
             x.round() as u32,
@@ -166,6 +170,16 @@ impl Pointer {
             self.queue.roundtrip(&mut self.state).unwrap();
             thread::sleep(Duration::from_millis(25));
         }
+        preview();
+        // A screenshot/inspection may take long enough for another input device
+        // to move. Make the tested drop coordinate and release one pointer frame.
+        self.device.motion_absolute(
+            4,
+            (x + dx).round() as u32,
+            (y + dy).round() as u32,
+            self.width as u32,
+            self.height as u32,
+        );
         self.device.button(4, 0x110, ButtonState::Released);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();

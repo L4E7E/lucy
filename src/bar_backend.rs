@@ -5,10 +5,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc, Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -390,14 +390,13 @@ pub(crate) fn output_audio_event(line: &str) -> bool {
 
 pub(crate) struct AudioWatcher {
     pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) subscriber: Arc<Mutex<Option<Child>>>,
     pub(crate) wake: mpsc::Sender<()>,
     pub(crate) handles: Vec<thread::JoinHandle<()>>,
+    subscription: Option<crate::audio_backend::AudioSubscription>,
 }
 impl AudioWatcher {
     pub(crate) fn new(updates: glib::Sender<Update>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let subscriber = Arc::new(Mutex::new(None::<Child>));
         let (wake, requests) = mpsc::channel();
         let stopping = stop.clone();
         let reader = thread::spawn(move || {
@@ -413,68 +412,24 @@ impl AudioWatcher {
                 }
             }
         });
-        let stopping = stop.clone();
-        let holder = subscriber.clone();
         let notify = wake.clone();
-        let events = thread::spawn(move || {
-            while !stopping.load(Ordering::Acquire) {
-                let child = Command::new("pactl")
-                    .arg("subscribe")
-                    .env("LC_ALL", "C")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn();
-                let Ok(mut child) = child else {
-                    let _ = notify.send(());
-                    thread::sleep(Duration::from_secs(1));
-                    continue;
-                };
-                let stdout = child.stdout.take().unwrap();
-                {
-                    let mut slot = holder.lock().unwrap();
-                    if stopping.load(Ordering::Acquire) {
-                        let _ = child.kill();
-                    }
-                    *slot = Some(child);
-                }
-                // Snapshot on initial subscription and after a server reconnect.
-                let _ = notify.send(());
-                for line in BufReader::new(stdout).lines() {
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match line {
-                        Ok(line) if output_audio_event(&line) => {
-                            let _ = notify.send(());
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-                if let Some(mut child) = holder.lock().unwrap().take() {
-                    let _ = child.wait();
-                }
-                if !stopping.load(Ordering::Acquire) {
-                    let _ = notify.send(());
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-        });
+        let subscription =
+            crate::audio_backend::AudioSubscription::new(output_audio_event, move || {
+                notify.send(()).is_ok()
+            });
         Self {
             stop,
-            subscriber,
             wake,
-            handles: vec![reader, events],
+            handles: vec![reader],
+            subscription: Some(subscription),
         }
     }
 }
 impl Drop for AudioWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.subscription.take();
         let _ = self.wake.send(());
-        if let Some(child) = self.subscriber.lock().unwrap().as_mut() {
-            let _ = child.kill();
-        }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }

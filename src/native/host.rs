@@ -62,6 +62,19 @@ enum Role {
     CenterOverlay(String),
     Bar(String, String),
 }
+impl Role {
+    fn affected(&self, page: Page, visible: bool, pages: &[Page], bars: &[&str]) -> bool {
+        match self {
+            Self::Bar(side, _) => bars.contains(&side.as_str()),
+            Self::Expanded(side, _) => {
+                bars.contains(&side.as_str()) || (visible && pages.contains(&page))
+            }
+            Self::Notice(_) | Self::CenterOverlay(_) => pages.contains(&Page::Calendar),
+            Self::Identify(_) => pages.contains(&Page::Display),
+            _ => visible && pages.contains(&page),
+        }
+    }
+}
 struct Output {
     object: wl_output::WlOutput,
     name: String,
@@ -95,6 +108,7 @@ struct Window {
     margin_top: i32,
     presented: u64,
     rasterized: u64,
+    painted: u64,
     scroll_until: std::time::Instant,
     surface: wl_surface::WlSurface,
     layer: layer::ZwlrLayerSurfaceV1,
@@ -108,6 +122,7 @@ struct Window {
     buffers: Vec<Buffer>,
     dirty: bool,
     frame: Option<wl_callback::WlCallback>,
+    last_present: std::time::Instant,
     raster: Option<cairo::ImageSurface>,
     header_dirty: bool,
     header_hits: Vec<super::model::Hit>,
@@ -126,6 +141,42 @@ impl Drop for Window {
     }
 }
 impl Window {
+    fn prepare_calendar_return(&mut self, model: &Model) -> Result<(), Box<dyn std::error::Error>> {
+        if !matches!(&self.role, Role::Expanded(side, _) if side == "center") {
+            return Ok(());
+        }
+        let Some(gpu) = &mut self.gpu else {
+            return Ok(());
+        };
+        let probe = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1)?;
+        let cr = cairo::Context::new(&probe)?;
+        let width = draw::bar_width(&cr, model, "center", "");
+        let mut image = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            (f64::from(width) * self.scale).ceil() as i32,
+            (34.0 * self.scale).ceil() as i32,
+        )?;
+        {
+            let cr = cairo::Context::new(&image)?;
+            cr.scale(self.scale, self.scale);
+            let mut options = cairo::FontOptions::new()?;
+            options.set_antialias(cairo::Antialias::Gray);
+            cr.set_font_options(&options);
+            draw::clock_header(&cr, model, width);
+        }
+        image.flush();
+        let (w, h) = (image.width(), image.height());
+        // Uploaded only on header changes / closing, never per animation frame.
+        gpu.set_return_header(&image.data()?, w, h, width as f32);
+        Ok(())
+    }
+    fn pending_motion(&self) -> bool {
+        matches!(self.role, Role::CenterOverlay(_))
+            && self.ready
+            && self.gpu.as_ref().is_some_and(|gpu| {
+                self.dirty || self.model_motion || gpu.animating() || gpu.closing()
+            })
+    }
     fn present(&mut self, _id: u32) -> bool {
         let Some(gpu) = self.gpu.as_ref() else {
             return false;
@@ -171,6 +222,7 @@ impl Window {
         self.frame = Some(self.surface.frame(&self.qh, self.native_id));
         let ok = gpu.present(expansion);
         self.presented += u64::from(ok);
+        self.last_present = std::time::Instant::now();
         ok
     }
 }
@@ -453,6 +505,7 @@ impl Client {
                 margin_top: 54,
                 presented: 0,
                 rasterized: 0,
+                painted: 0,
                 scroll_until: std::time::Instant::now(),
                 surface,
                 layer,
@@ -466,6 +519,7 @@ impl Client {
                 buffers: vec![],
                 dirty: true,
                 frame: None,
+                last_present: std::time::Instant::now(),
                 raster: None,
                 header_dirty: true,
                 header_hits: vec![],
@@ -521,7 +575,7 @@ impl Client {
     fn show_osd(&mut self, state: super::osd::State, qh: &QueueHandle<Self>) {
         self.model.osd = Some(state);
         self.osd_deadline =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(1400));
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(1100));
         self.update_center_overlay(qh);
     }
     fn update_center_overlay(&mut self, qh: &QueueHandle<Self>) {
@@ -612,6 +666,25 @@ impl Client {
                 self.redraw_window(id, true, qh);
             }
         }
+    }
+    fn finish_closed_window(&mut self, id: u32, qh: &QueueHandle<Self>) -> bool {
+        let Some(role) = self.windows.get(&id).and_then(|w| {
+            w.gpu
+                .as_ref()
+                .is_some_and(|g| g.closing() && !g.animating())
+                .then(|| w.role.clone())
+        }) else {
+            return false;
+        };
+        if matches!(role, Role::CenterOverlay(_)) {
+            self.restore_center_overlay(id, qh);
+        } else if matches!(role, Role::Notice(_)) {
+            self.windows.remove(&id);
+            self.model.hits.remove(&id);
+        } else {
+            self.hide_immediate();
+        }
+        true
     }
     fn fallback_notifications(
         &mut self,
@@ -743,7 +816,7 @@ impl Client {
                 .values()
                 .find(|o| Some(&o.name) == name.as_ref())
                 .or_else(|| self.outputs.values().next())
-                .map(|o| (o.object.clone(), o.scale));
+                .map(|o| (o.name.clone(), o.object.clone(), o.scale));
             let side = if calendar { "center" } else { "right" };
             if self.bar && !launcher && !session && Page::parse(page) != Page::TrayMenu {
                 let source = self.windows.iter().find(|(_, w)| matches!(&w.role, Role::Bar(s,n) if s == side && name.as_ref().is_none_or(|wanted| wanted == n))).map(|(id,_)| *id);
@@ -779,8 +852,14 @@ impl Client {
                     return;
                 }
             }
-            self.backdrop = if session {
-                crate::dismiss::Backdrop::session(self.clicked.clone())
+            self.backdrop = if self.automated_preview && !session {
+                None
+            } else if session {
+                crate::dismiss::Backdrop::session(
+                    self.clicked.clone(),
+                    super::lock_draw::session_capture,
+                )
+                .ok()
             } else {
                 crate::dismiss::Backdrop::new(
                     if launcher {
@@ -792,9 +871,9 @@ impl Client {
                     },
                     self.clicked.clone(),
                 )
-            }
-            .ok();
-            let (object, scale) = output.map_or((None, 1.0), |(o, s)| (Some(o), s));
+                .ok()
+            };
+            let (object, scale) = output.map_or((None, 1.0), |(_, o, s)| (Some(o), s));
             self.create(
                 1,
                 if launcher {
@@ -813,21 +892,23 @@ impl Client {
         }
         self.redraw(qh);
     }
-    fn collapsed_right_width(&self, id: u32) -> Option<i32> {
+    fn collapsed_bar_width(&self, id: u32) -> Option<i32> {
         let window = self.windows.get(&id)?;
         let Role::Expanded(side, output) = &window.role else {
             return None;
         };
-        if side != "right" {
-            return None;
-        }
         let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).ok()?;
         let cr = cairo::Context::new(&image).ok()?;
         Some(draw::bar_width(&cr, &self.model, side, output))
     }
     fn hide(&mut self) {
-        let return_width = self.collapsed_right_width(1);
+        let return_width = self.collapsed_bar_width(1);
         if let Some(win) = self.windows.get_mut(&1) {
+            if !win.gpu.as_ref().is_some_and(|g| g.closing()) {
+                if let Err(error) = win.prepare_calendar_return(&self.model) {
+                    eprintln!("Lucy collapsed clock: {error}");
+                }
+            }
             if let Some(gpu) = win.gpu.as_mut() {
                 if gpu.closing() {
                     return;
@@ -837,10 +918,10 @@ impl Client {
                     self.backdrop = None;
                 }
                 self.repeat = None;
+                gpu.close();
                 if let Some(width) = return_width {
                     gpu.set_return_width(width);
                 }
-                gpu.close();
                 if win.frame.is_none() {
                     win.present(1);
                 }
@@ -984,6 +1065,21 @@ impl Client {
             self.wake();
         }
     }
+    fn redraw_relevant(&mut self, pages: &[Page], bars: &[&str], qh: &QueueHandle<Self>) {
+        // Prompt insertion/reveal still uses the complete layout preparation.
+        if self.model.ensure_entry_visible {
+            self.redraw(qh);
+            return;
+        }
+        self.sync_idle(qh);
+        let windows: Vec<_> = self.windows.iter().filter_map(|(&id, window)| {
+            window.role.affected(self.model.page, self.model.visible, pages, bars)
+                .then_some((id, matches!(&window.role, Role::Expanded(side, _) if bars.contains(&side.as_str()))))
+        }).collect();
+        for (id, header) in windows {
+            self.redraw_window(id, header, qh);
+        }
+    }
     fn redraw_scroll(&mut self, id: u32, qh: &QueueHandle<Self>) {
         if let Some(window) = self.windows.get_mut(&id) {
             window.scroll_until = std::time::Instant::now() + std::time::Duration::from_millis(55);
@@ -1080,6 +1176,7 @@ impl Client {
             win.dirty = false;
             return Ok(());
         }
+        win.painted += 1;
         let desired = match &win.role {
             Role::Identify(_) => (220, 140),
             Role::CenterOverlay(_) => {
@@ -1118,7 +1215,8 @@ impl Client {
         if (win.width, win.height) != desired {
             win.width = desired.0;
             win.height = desired.1;
-            win.layer.set_size(win.width as u32, win.height as u32);
+            // GPU geometry is committed by Window::present together with its
+            // new buffer. Publishing the final size here bypasses expansion.
         }
         let (w, h) = (
             (f64::from(win.width) * win.scale).ceil() as i32,
@@ -1135,6 +1233,9 @@ impl Client {
                     self.gpu.take();
                 }
             }
+        }
+        if win.header_dirty || win.header_hits.is_empty() {
+            win.prepare_calendar_return(&self.model)?;
         }
         if let Some(gpu) = win.gpu.as_mut() {
             gpu.set_launcher(matches!(win.role, Role::Launcher));
@@ -1166,7 +1267,9 @@ impl Client {
                 None => cairo::ImageSurface::create(cairo::Format::ARgb32, w, h)?,
             };
             let mut header_changed = false;
+            let mut gauge_specs = Vec::new();
             {
+                let gauge_capture = draw::GaugeCapture::enter();
                 let cr = cairo::Context::new(&image)?;
                 cr.set_operator(cairo::Operator::Clear);
                 cr.paint()?;
@@ -1203,6 +1306,7 @@ impl Client {
                         .scroll
                         .clamp(0.0, (scene.content_height - scene.viewport_height).max(0.0));
                     if scroll != self.model.scroll {
+                        gauge_capture.take();
                         self.model.scroll = scroll;
                         cr.set_operator(cairo::Operator::Clear);
                         cr.paint()?;
@@ -1275,8 +1379,23 @@ impl Client {
                         win.header_hits = hs.hits;
                         header.flush();
                         let (hw, hh) = (header.width(), header.height());
-                        header_changed =
-                            gpu.set_header(&header.data()?, hw, hh, header_width as f32);
+                        header_changed = if matches!(&win.role, Role::Expanded(side, _) if side == "center")
+                            && self.model.page == Page::Calendar
+                        {
+                            let minute = glib::DateTime::now_local()
+                                .unwrap()
+                                .to_unix()
+                                .div_euclid(60);
+                            gpu.set_clock_header(
+                                &header.data()?,
+                                hw,
+                                hh,
+                                header_width as f32,
+                                minute,
+                            )
+                        } else {
+                            gpu.set_header(&header.data()?, hw, hh, header_width as f32)
+                        };
                         win.header_dirty = false;
                     }
                     scene.hits.extend(win.header_hits.clone());
@@ -1288,6 +1407,7 @@ impl Client {
                     );
                     gpu.set_osd(matches!(win.role, Role::CenterOverlay(_)));
                 }
+                gauge_specs.extend(gauge_capture.take());
                 self.model.hits.insert(id, scene.hits);
             }
             image.flush();
@@ -1337,7 +1457,11 @@ impl Client {
                 // Numeric telemetry needs one frame, not a transition on every sample.
                 super::gpu::Effect::Immediate
             } else if matches!(win.role, Role::CenterOverlay(_)) {
-                super::gpu::Effect::Change
+                if self.model.osd.is_some() {
+                    super::gpu::Effect::Immediate
+                } else {
+                    super::gpu::Effect::Change
+                }
             } else if win.page != self.model.page && !matches!(win.role, Role::Bar(_, _)) {
                 if self.model.page == Page::Home {
                     super::gpu::Effect::SlideBack
@@ -1352,8 +1476,10 @@ impl Client {
                 // Wheel/drag/search already produce successive viewport snapshots.
                 // Crossfading them makes text trail and delays the actual scroll.
                 super::gpu::Effect::Immediate
-            } else if matches!(self.model.page, Page::Network | Page::Calendar)
-                || self.model.animating()
+            } else if matches!(
+                self.model.page,
+                Page::Network | Page::Calendar | Page::System
+            ) || self.model.animating()
             {
                 // The tab highlight/icons already interpolate their geometry.
                 // Do not crossfade these animation samples a second time.
@@ -1362,6 +1488,11 @@ impl Client {
                 super::gpu::Effect::Change
             };
             let scroll_changed = win.scroll != self.model.scroll && id == 1;
+            let gauges_changed = gpu.set_gauges(
+                gauge_specs,
+                (win.width, win.height),
+                win.page != self.model.page,
+            );
             win.page = self.model.page;
             win.scroll = self.model.scroll;
             win.calendar_offset = self.model.calendar_offset;
@@ -1376,7 +1507,12 @@ impl Client {
                 || (id == 1 && self.scroll.active())
                 || matches!(&win.role,Role::Bar(side,_) if side=="right" && self.model.tray_animating());
             win.tray_motion = self.model.tray_animating();
-            if !changed && !header_changed && !gpu.animating() && !win.model_motion {
+            if !changed
+                && !gauges_changed
+                && !header_changed
+                && !gpu.animating()
+                && !win.model_motion
+            {
                 win.dirty = false;
                 return Ok(());
             }
@@ -1390,6 +1526,8 @@ impl Client {
             self.wake();
             return Ok(());
         }
+        // SHM fallback has no Window::present; commit its final size with attach.
+        win.layer.set_size(win.width as u32, win.height as u32);
         win.buffers
             .retain(|b| b.busy || (b.width, b.height) == (w, h));
         let index = if let Some(i) = win
@@ -1593,6 +1731,13 @@ impl Client {
                 return false;
             }
             self.hide();
+            return false;
+        }
+        if self.model.visible && self.model.page == Page::Session && !ctrl {
+            if let Some(command) = super::model::session_shortcut(sym) {
+                self.model.activate(Action::Session(command));
+                self.hide();
+            }
             return false;
         }
         if self.model.page == Page::Launcher {
@@ -1854,7 +1999,11 @@ impl Client {
             }
         }
         if matches!(hit.action, Action::Page(Page::Session)) {
-            self.show_at("session", None, qh);
+            let output = self.windows.get(&id).and_then(|w| match &w.role {
+                Role::Bar(_, name) | Role::Expanded(_, name) => Some(name.clone()),
+                _ => None,
+            });
+            self.show_at("session", output.as_deref(), qh);
             return;
         }
         if self.bar && id != 1 {
@@ -2015,6 +2164,7 @@ fn page_name(p: Page) -> &'static str {
         Page::Bluetooth => "bluetooth",
         Page::Power => "power",
         Page::Display => "display",
+        Page::System => "system",
         Page::Session => "session",
         Page::TrayMenu => "tray",
         Page::Calendar => "calendar",
@@ -2132,7 +2282,9 @@ impl Dispatch<layer::ZwlrLayerSurfaceV1, u32> for Client {
                 l.ack_configure(serial);
                 if let Some(w) = s.windows.get(id) {
                     if w.ready && w.gpu.is_some() {
-                        w.surface.commit();
+                        // Ack only: the next EGL swap commits viewport, size
+                        // and fresh content atomically. An empty commit here
+                        // can publish pending geometry with an older bar buffer.
                         let _ = s.connection.flush();
                         return;
                     }
@@ -2190,7 +2342,7 @@ impl Dispatch<wl_callback::WlCallback, u32> for Client {
             .get(id)
             .is_some_and(|w| w.gpu.as_ref().is_some_and(|g| g.closing()))
         {
-            s.collapsed_right_width(*id)
+            s.collapsed_bar_width(*id)
         } else {
             None
         };
@@ -2252,6 +2404,23 @@ impl Dispatch<wl_buffer::WlBuffer, u32> for Client {
             if let Some(w) = s.windows.get_mut(id) {
                 if let Some(buffer) = w.buffers.iter_mut().find(|x| x.object == *b) {
                     buffer.busy = false;
+                }
+                if w.gpu.is_none() {
+                    let size = (
+                        (f64::from(w.width) * w.scale).ceil() as i32,
+                        (f64::from(w.height) * w.scale).ceil() as i32,
+                    );
+                    let mut free = 0;
+                    w.buffers.retain(|b| {
+                        if b.busy {
+                            return true;
+                        }
+                        if (b.width, b.height) != size {
+                            return false;
+                        }
+                        free += 1;
+                        free <= 2
+                    });
                 }
                 if w.dirty {
                     let _ = s.paint(*id, qh);
@@ -2573,15 +2742,39 @@ struct Runtime {
     qh: QueueHandle<Client>,
     tray: RefCell<Option<tray::Tray>>,
     pulse: RefCell<Option<glib::SourceId>>,
+    frame_pump: RefCell<Option<glib::SourceId>>,
     osd_timer: RefCell<Option<glib::SourceId>>,
     identify_timer: RefCell<Option<glib::SourceId>>,
     media_timer: RefCell<Option<glib::SourceId>>,
     notifications: RefCell<Option<super::notifications::Monitor>>,
     notification_server: RefCell<Option<super::notification_server::Server>>,
+    app_load: CatalogLoad,
+}
+#[derive(Default)]
+struct CatalogLoad {
+    running: std::cell::Cell<bool>,
+    queued: std::cell::Cell<bool>,
+}
+impl CatalogLoad {
+    fn begin(&self) -> bool {
+        if self.running.replace(true) {
+            self.queued.set(true);
+            false
+        } else {
+            true
+        }
+    }
+    fn finish(&self) -> bool {
+        self.running.set(false);
+        self.queued.replace(false)
+    }
 }
 impl Runtime {
     #[allow(deprecated)]
     fn load_apps(self: &Rc<Self>) {
+        if !self.app_load.begin() {
+            return;
+        }
         let (tx, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
         let weak = Rc::downgrade(self);
         rx.attach(
@@ -2590,13 +2783,21 @@ impl Runtime {
                 let Some(rt) = weak.upgrade() else {
                     return ControlFlow::Break;
                 };
-                let mut c = rt.client.borrow_mut();
-                c.model.launcher.apps = apps;
-                c.model.launcher.ready = true;
-                let len = c.model.launcher.results().len();
-                c.model.launcher.selected = c.model.launcher.selected.min(len.saturating_sub(1));
-                c.redraw(&rt.qh);
+                if !rt.app_load.queued.get() {
+                    let mut c = rt.client.borrow_mut();
+                    c.model.launcher.set_apps(apps);
+                    c.model.launcher.ready = true;
+                    let len = c.model.launcher.results().len();
+                    c.model.launcher.selected =
+                        c.model.launcher.selected.min(len.saturating_sub(1));
+                    if c.model.visible && c.model.page == Page::Launcher {
+                        c.redraw_window(1, false, &rt.qh);
+                    }
+                }
                 if done {
+                    if rt.app_load.finish() {
+                        rt.load_apps();
+                    }
                     ControlFlow::Break
                 } else {
                     ControlFlow::Continue
@@ -2613,6 +2814,73 @@ impl Runtime {
         });
     }
     fn animate(self: &Rc<Self>) {
+        // Normally compositor-paced. Some EGL/viewport commits leave callbacks
+        // pending without a repaint; bound that wait only during active work.
+        let moving = self
+            .client
+            .borrow()
+            .windows
+            .values()
+            .any(Window::pending_motion);
+        if moving && self.frame_pump.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            *self.frame_pump.borrow_mut() = Some(glib::timeout_add_local(
+                std::time::Duration::from_millis(8),
+                move || {
+                    let Some(rt) = weak.upgrade() else {
+                        return ControlFlow::Break;
+                    };
+                    rt.dispatch();
+                    {
+                        let mut c = rt.client.borrow_mut();
+                        let stalled: Vec<_> = c
+                            .windows
+                            .iter()
+                            .filter_map(|(&id, w)| {
+                                (w.pending_motion()
+                                    && w.frame.is_some()
+                                    && w.last_present.elapsed()
+                                        >= std::time::Duration::from_millis(16))
+                                .then_some(id)
+                            })
+                            .collect();
+                        for id in stalled {
+                            if c.finish_closed_window(id, &rt.qh) {
+                                continue;
+                            }
+                            let w = c.windows.get_mut(&id).unwrap();
+                            // A late callback is ignored by the identity check.
+                            w.frame = None;
+                            if w.model_motion && !w.gpu.as_ref().is_some_and(|g| g.closing()) {
+                                w.dirty = true;
+                                w.header_dirty |= w.tray_motion;
+                            }
+                            if w.dirty && !w.gpu.as_ref().is_some_and(|g| g.closing()) {
+                                if let Err(error) = c.paint(id, &rt.qh) {
+                                    eprintln!("Lucy frame recovery: {error}");
+                                }
+                            } else {
+                                w.present(id);
+                            }
+                            c.finish_closed_window(id, &rt.qh);
+                        }
+                        let _ = c.connection.flush();
+                    }
+                    rt.effects();
+                    let moving = rt
+                        .client
+                        .borrow()
+                        .windows
+                        .values()
+                        .any(Window::pending_motion);
+                    if !moving {
+                        rt.frame_pump.borrow_mut().take();
+                        return ControlFlow::Break;
+                    }
+                    ControlFlow::Continue
+                },
+            ));
+        }
         if self.client.borrow().osd_deadline.is_some() && self.osd_timer.borrow().is_none() {
             let weak = Rc::downgrade(self);
             *self.osd_timer.borrow_mut() = Some(glib::timeout_add_local(
@@ -2916,6 +3184,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "network"
             } else if args.iter().any(|a| a == "display") {
                 "display"
+            } else if args.iter().any(|a| a == "system" || a == "monitor") {
+                "system"
             } else if args.iter().any(|a| a == "launcher") {
                 "launcher"
             } else {
@@ -3040,11 +3310,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         qh,
         tray: RefCell::new(None),
         pulse: RefCell::new(None),
+        frame_pump: RefCell::new(None),
         osd_timer: RefCell::new(None),
         identify_timer: RefCell::new(None),
         media_timer: RefCell::new(None),
         notifications: RefCell::new(None),
         notification_server: RefCell::new(None),
+        app_load: CatalogLoad::default(),
     });
     let weak = Rc::downgrade(&rt);
     clicks.attach(None, move |_| {
@@ -3134,9 +3406,41 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             },
                             "bars": c.windows.values().filter_map(|w| match &w.role { Role::Bar(side, output) => Some(serde_json::json!({"side":side,"output":output,"surface":w.surface.id().protocol_id(),"size":[w.width,w.height]})), _=>None }).collect::<Vec<_>>(),
                             "tray_toggles":c.windows.iter().flat_map(|(id,w)|c.model.hits.get(id).into_iter().flatten().filter(|h|matches!(h.action,Action::Tray)).map(move|h|serde_json::json!({"surface":w.surface.id().protocol_id(),"right":f64::from(w.display_size.0)-h.rect.x,"y":h.rect.y,"width":h.rect.w,"height":h.rect.h}))).collect::<Vec<_>>(),
-                            "surfaces":c.windows.values().map(|w|serde_json::json!({"role":format!("{:?}",w.role),"surface":w.surface.id().protocol_id(),"size":w.display_size,"presented":w.presented,"rasterized":w.rasterized,"animating":w.model_motion||w.gpu.as_ref().is_some_and(|g|g.animating())})).collect::<Vec<_>>(),
+                            "surfaces":c.windows.values().map(|w|serde_json::json!({"role":format!("{:?}",w.role),"surface":w.surface.id().protocol_id(),"size":w.display_size,"presented":w.presented,"rasterized":w.rasterized,"painted":w.painted,"animating":w.model_motion||w.gpu.as_ref().is_some_and(|g|g.animating())})).collect::<Vec<_>>(),
                         });
                         status["font"] = c.model.font.clone().into();
+                        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                        {
+                            let heap = unsafe { libc::mallinfo2() };
+                            status["allocator"] = serde_json::json!({
+                                "in_use": heap.uordblks,
+                                "free": heap.fordblks,
+                                "mapped": heap.hblkhd,
+                            });
+                        }
+                        status["gpu_gauges"] = w
+                            .and_then(|w| w.gpu.as_ref())
+                            .map_or(0, |g| g.gauge_count())
+                            .into();
+                        status["monitor"] = c
+                            .model
+                            .monitor
+                            .status(c.model.visible && c.model.page == Page::System);
+                        status["system_targets"] = c.windows.iter().flat_map(|(id,w)| {
+                            let output = match &w.role { Role::Bar(side,output)|Role::Expanded(side,output) if side=="right" => output.as_str(), _=>"" };
+                            c.model.hits.get(id).into_iter().flatten().filter(|h|matches!(h.action,Action::Page(Page::System))).map(move|h|serde_json::json!({"output":output,"surface":w.surface.id().protocol_id(),"width":w.display_size.0,"rect":[h.rect.x,h.rect.y,h.rect.w,h.rect.h]}))
+                        }).collect::<Vec<_>>().into();
+                        status["display"]["dragging"] = c.model.display_dragging().into();
+                        status["display"]["snap_preview"] = c
+                            .model
+                            .display_snap_preview()
+                            .map(|draft| {
+                                draft
+                                    .iter()
+                                    .map(|p| serde_json::json!({"name":p.name,"x":p.x,"y":p.y}))
+                                    .collect::<Vec<_>>()
+                            })
+                            .into();
                         if c.model.readonly {
                             status["launcher_input"] = serde_json::json!({"query":c.model.launcher.query,"preedit":c.model.preedit,"preedit_cursor":c.model.preedit_cursor,"caret_index":draw::launcher_caret_index(&c.model),"cursor":c.model.launcher.cursor,"serial":c.input_serial,"deferred":c.input_deferred});
                         }
@@ -3156,6 +3460,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 })
                             })
                             .into();
+                        status["frame_pump"] = rt.frame_pump.borrow().is_some().into();
                         status["network"] = serde_json::json!({
                             "ready": c.model.network.is_some(),
                             "wifi": c.model.wifi_enabled(),
@@ -3191,6 +3496,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             rt.effects();
+            rt.animate();
             ControlFlow::Continue
         },
     );
@@ -3207,6 +3513,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut sources = vec![wayland_source, socket_source, wake_source];
+    let (monitor_tx, monitor_rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+    let monitor_worker = super::monitor::Worker::new(monitor_tx);
+    rt.client.borrow_mut().model.monitor_tx = Some(monitor_worker.tx.clone());
+    if rt.client.borrow().model.visible && rt.client.borrow().model.page == Page::System {
+        let _ = monitor_worker
+            .tx
+            .send(super::monitor::Request::Visible(true));
+    }
+    let weak = Rc::downgrade(&rt);
+    sources.push(monitor_rx.attach(None, move |state| {
+        let Some(rt) = weak.upgrade() else {
+            return ControlFlow::Break;
+        };
+        let mut c = rt.client.borrow_mut();
+        if c.model.visible && c.model.page == Page::System {
+            c.model.monitor = state;
+            c.redraw_window(1, false, &rt.qh);
+        }
+        drop(c);
+        rt.animate();
+        ControlFlow::Continue
+    }));
     let _osd_backend = if bar && !preview {
         let (tx, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
         let backend = super::osd::Backend::start(tx);
@@ -3252,7 +3580,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .values()
                     .any(|w| matches!(w.role, Role::Notice(_) | Role::CenterOverlay(_)))
             {
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Calendar], &[], &rt.qh);
             }
             ControlFlow::Continue
         }));
@@ -3369,6 +3697,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(rt) = weak.upgrade() {
                 let mut warning = None;
                 let mut c = rt.client.borrow_mut();
+                let side = match &event {
+                    bar::Update::Metrics(_) | bar::Update::Audio(_) => "right",
+                    bar::Update::Workspaces(_) => "left",
+                    bar::Update::Outputs(_) => "",
+                };
                 match event {
                     bar::Update::Metrics(mut state) => {
                         warning = battery_watch.update(state.values.get("battery").and_then(|m| {
@@ -3402,7 +3735,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                c.redraw(&rt.qh);
+                if side.is_empty() {
+                    c.redraw(&rt.qh);
+                } else {
+                    c.redraw_relevant(&[], &[side], &rt.qh);
+                }
                 drop(c);
                 if let Some(percent) = warning {
                     if let Some(server) = rt.notification_server.borrow().as_ref() {
@@ -3420,8 +3757,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(rt) = weak.upgrade() {
                 let now = glib::DateTime::now_local().map_or(-1, |n| n.minute());
                 if minute.replace(now) != now {
-                    rt.client.borrow_mut().sync_gamma(&rt.qh);
-                    rt.changed();
+                    let mut c = rt.client.borrow_mut();
+                    c.sync_gamma(&rt.qh);
+                    c.redraw_relevant(&[Page::Calendar], &["center"], &rt.qh);
                 }
                 ControlFlow::Continue
             } else {
@@ -3443,7 +3781,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             c.model.display_state(state);
             c.sync_gamma(&rt.qh);
             if c.model.visible && c.model.page == Page::Display {
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Display], &[], &rt.qh);
             }
             ControlFlow::Continue
         }));
@@ -3462,7 +3800,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     control::Event::State(s) => c.model.common_state(*s),
                     control::Event::Done(domain, success) => c.model.settle(domain, success),
                 }
-                c.redraw(&rt.qh);
+                c.redraw_relevant(
+                    &[
+                        Page::Home,
+                        Page::Audio,
+                        Page::Network,
+                        Page::Bluetooth,
+                        Page::Power,
+                        Page::Display,
+                    ],
+                    &["right"],
+                    &rt.qh,
+                );
                 drop(c);
                 request_cover(&rt);
                 rt.effects();
@@ -3486,7 +3835,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     audio::Event::State(s) => c.model.audio_state(s),
                     audio::Event::Error(e) => c.model.status = e,
                 }
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Home, Page::Audio], &["right"], &rt.qh);
                 drop(c);
                 rt.animate();
                 ControlFlow::Continue
@@ -3509,7 +3858,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(rt) = weak.upgrade() {
                 let mut c = rt.client.borrow_mut();
                 c.model.network_event(event);
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Home, Page::Network], &["right"], &rt.qh);
                 drop(c);
                 rt.animate();
                 ControlFlow::Continue
@@ -3531,7 +3880,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(rt) = weak.upgrade() {
                 let mut c = rt.client.borrow_mut();
                 c.model.bluetooth_state(state);
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Home, Page::Bluetooth], &["right"], &rt.qh);
                 drop(c);
                 rt.animate();
                 ControlFlow::Continue
@@ -3577,7 +3926,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         c.show_osd(super::osd::State::profile(profile), &rt.qh);
                     }
                 }
-                c.redraw(&rt.qh);
+                c.redraw_relevant(&[Page::Home, Page::Power], &["right"], &rt.qh);
                 drop(c);
                 rt.animate();
                 ControlFlow::Continue
@@ -3711,7 +4060,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             else if i==10 {c.show("home",&rt.qh);}
             else if i==11 {
-                c.model.launcher.apps=super::launcher::catalog();c.model.launcher.ready=true;c.show("launcher",&rt.qh);
+                c.model.launcher.set_apps(super::launcher::catalog());c.model.launcher.ready=true;c.show("launcher",&rt.qh);
             }
             else if i==12 {
                 if c.windows.get(&1).is_none_or(|w| !matches!(w.role,Role::Launcher) || (w.width,w.height)!=(super::launcher::WIDTH,super::launcher::HEIGHT)) {eprintln!("native UI test: launcher surface is missing");c.loop_.quit();return ControlFlow::Break;}
@@ -3744,6 +4093,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             else if i==17 {
                 if c.model.visible || c.windows.contains_key(&1) || c.backdrop.is_some() {eprintln!("native UI test: Escape did not remove the session chooser and scrim");c.loop_.quit();return ControlFlow::Break;}
+                if !c.model.readonly {eprintln!("native UI test: session shortcuts require a read-only fixture");c.loop_.quit();return ControlFlow::Break;}
+                for key in 2..=6 {
+                    c.show("session",&rt.qh);
+                    c.key(key,&rt.qh);
+                    if c.model.visible {eprintln!("native UI test: session number shortcut did not dismiss the read-only chooser");c.loop_.quit();return ControlFlow::Break;}
+                }
                 c.show("home",&rt.qh);
             }
             else {passed.set(true);println!("PASS: control pages retain one 480x500 surface; separate calendar, launcher and session chooser; five square session buttons and Escape dismissal; launcher grid and UTF-8 search; network draft preserved; GTK not initialized. No app launches or session actions.");c.loop_.quit();return ControlFlow::Break;}
@@ -3790,6 +4145,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(audio_backend);
     drop(common_backend);
     drop(bar_workers);
+    drop(monitor_worker);
     let _ = fs::remove_file(socket_path);
     drop(lock);
     if native_test && !test_passed.get() {
@@ -3804,6 +4160,13 @@ impl Client {
             return;
         }
         match command {
+            page if page.starts_with("@preview-session:") => {
+                let name = &page["@preview-session:".len()..];
+                if self.outputs.values().any(|o| o.name == name) {
+                    self.hide_immediate();
+                    self.show_at("session", Some(name), qh);
+                }
+            }
             "@preview-media" => {
                 self.model.common.media = Some(control::Media {
                     player: "LucyPreview".into(),
@@ -3827,6 +4190,12 @@ impl Client {
                 if outputs.is_empty() {
                     let raw = serde_json::json!({"eDP-1":{"make":"BOE","model":"Preview","modes":[{"width":2560,"height":1600,"refresh_rate":165000}],"current_mode":0,"logical":{"x":0,"y":0,"width":1706,"height":1066,"scale":1.5}}});
                     outputs = display::parse_outputs(&raw);
+                }
+                if let Some(index) = outputs
+                    .iter()
+                    .position(|o| o.name.starts_with("eDP-") || o.name.starts_with("LVDS-"))
+                {
+                    outputs.swap(0, index);
                 }
                 outputs.truncate(1);
                 let mut external = outputs[0].clone();
@@ -3863,6 +4232,10 @@ impl Client {
                 outputs.push(external);
                 self.model.display.outputs = outputs;
                 self.model.display.ready = true;
+                self.model.scroll = 0.0;
+                self.scroll.reset(0.0);
+                self.model.display_layout.clear();
+                self.model.display_menu = None;
                 self.model.gamma_supported = true;
                 self.model.navigate(Page::Display);
                 self.redraw(qh);
@@ -3988,7 +4361,7 @@ impl Client {
                             icon: Some(tray::Icon {
                                 width: 2,
                                 height: 2,
-                                bytes: [90, 140, 220, 255].repeat(4),
+                                bytes: [90, 140, 220, 255].repeat(4).into(),
                             }),
                         })
                         .collect();
@@ -4206,4 +4579,41 @@ fn request_media_app(rt: &Rc<Runtime>) {
         super::launcher::load_icons(&mut apps);
         let _ = tx.send((player, name, apps[0].icon.take()));
     });
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    #[test]
+    fn backend_refreshes_do_not_invalidate_unrelated_surfaces() {
+        let affected = |role: Role| role.affected(Page::Launcher, true, &[], &["right"]);
+        assert!(affected(Role::Bar("right".into(), "test".into())));
+        assert!(affected(Role::Expanded("right".into(), "test".into())));
+        assert!(!affected(Role::Bar("left".into(), "test".into())));
+        assert!(!affected(Role::Bar("center".into(), "test".into())));
+        assert!(!affected(Role::Launcher));
+        assert!(!affected(Role::CenterOverlay("test".into())));
+        assert!(Role::Launcher.affected(Page::Launcher, true, &[Page::Launcher], &[]));
+        assert!(!Role::Launcher.affected(Page::Launcher, false, &[Page::Launcher], &[]));
+        assert!(Role::CenterOverlay("test".into()).affected(
+            Page::Home,
+            false,
+            &[Page::Calendar],
+            &[]
+        ));
+    }
+    #[test]
+    fn catalog_requests_allow_one_worker_and_one_coalesced_followup() {
+        let load = CatalogLoad::default();
+        assert!(load.begin());
+        for _ in 0..100 {
+            assert!(!load.begin());
+        }
+        assert!(load.queued.get());
+        assert!(load.finish());
+        assert!(load.begin());
+        assert!(!load.queued.get());
+        assert!(!load.finish());
+        assert!(!load.running.get());
+    }
 }

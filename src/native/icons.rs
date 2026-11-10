@@ -1,7 +1,6 @@
 //! Lucy status icons: one vector grid, independent of private-use font glyphs.
 use super::{draw, model::Rect};
 use cairo::Context;
-use gdk_pixbuf::prelude::*;
 use std::f64::consts::PI;
 
 /// Two continuous return arrows on a symmetric 24 px grid.
@@ -31,51 +30,32 @@ pub fn refresh(cr: &Context, r: Rect, enabled: bool) {
     let _ = cr.restore();
 }
 
-fn logo_surface() -> Option<cairo::ImageSurface> {
-    let loader = gdk_pixbuf::PixbufLoader::new();
-    loader.set_size(64, 64);
-    loader.write(include_bytes!("../../Lucy_logo.png")).ok()?;
-    loader.close().ok()?;
-    let p = loader.pixbuf()?;
-    let (w, h) = (p.width(), p.height());
-    let src = p.read_pixel_bytes();
-    let stride = p.rowstride() as usize;
-    let n = p.n_channels() as usize;
-    let mut bytes = vec![0; (w * h * 4) as usize];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let i = y * stride + x * n;
-            let o = (y * w as usize + x) * 4;
-            let a = if n == 4 { src[i + 3] } else { 255 };
-            bytes[o] = (u16::from(src[i + 2]) * u16::from(a) / 255) as u8;
-            bytes[o + 1] = (u16::from(src[i + 1]) * u16::from(a) / 255) as u8;
-            bytes[o + 2] = (u16::from(src[i]) * u16::from(a) / 255) as u8;
-            bytes[o + 3] = a;
+/// Conventional app drawer: nine rounded tiles, with no logo asset or font glyph.
+pub fn launcher(cr: &Context, r: Rect) {
+    let size = 14.0_f64.min(r.w).min(r.h);
+    if size <= 0.0 {
+        return;
+    }
+    let _ = cr.save();
+    cr.translate(r.x + (r.w - size) / 2.0, r.y + (r.h - size) / 2.0);
+    cr.scale(size / 18.0, size / 18.0);
+    cr.set_source_rgb(0.96, 0.97, 1.0);
+    for row in 0..3 {
+        for column in 0..3 {
+            draw::round(
+                cr,
+                Rect {
+                    x: f64::from(column) * 7.0,
+                    y: f64::from(row) * 7.0,
+                    w: 4.0,
+                    h: 4.0,
+                },
+                1.1,
+            );
+            let _ = cr.fill();
         }
     }
-    cairo::ImageSurface::create_for_data(bytes, cairo::Format::ARgb32, w, h, w * 4).ok()
-}
-pub fn logo(cr: &Context, r: Rect) {
-    thread_local! {static LOGO: Option<cairo::ImageSurface> = logo_surface();}
-    LOGO.with(|logo| {
-        if let Some(logo) = logo {
-            let size = 28.0_f64.min(r.w).min(r.h);
-            let _ = cr.save();
-            cr.translate(r.x + (r.w - size) / 2.0, r.y + (r.h - size) / 2.0);
-            cr.scale(
-                size / f64::from(logo.width()),
-                size / f64::from(logo.height()),
-            );
-            if draw::is_bar() {
-                cr.set_source_rgb(0.96, 0.97, 1.0);
-                let _ = cr.mask_surface(logo, 0.0, 0.0);
-            } else {
-                let _ = cr.set_source_surface(logo, 0.0, 0.0);
-                let _ = cr.paint();
-            }
-            let _ = cr.restore();
-        }
-    });
+    let _ = cr.restore();
 }
 
 pub fn value(text: &str) -> &str {
@@ -106,7 +86,7 @@ pub fn battery(cr: &Context, font: &str, r: Rect, level: u32, charging: bool) {
     } else if draw::is_glass() {
         (0.55, 0.83, 0.65)
     } else {
-        (142.0 / 255.0, 216.0 / 255.0, 190.0 / 255.0)
+        (232.0 / 255.0, 234.0 / 255.0, 237.0 / 255.0)
     };
     let _ = cr.save();
     let body = Rect {
@@ -216,7 +196,7 @@ pub fn status(cr: &Context, r: Rect, key: &str, state: &str) {
         } else if key == "power" {
             (0.95, 0.96, 0.97)
         } else {
-            (142.0 / 255.0, 216.0 / 255.0, 190.0 / 255.0)
+            (232.0 / 255.0, 234.0 / 255.0, 237.0 / 255.0)
         },
     );
 }
@@ -231,7 +211,7 @@ pub fn chevron(cr: &Context, r: Rect, expanded: bool) {
     let ink = if draw::is_glass() {
         (0.96, 0.97, 1.0)
     } else {
-        (142.0 / 255.0, 216.0 / 255.0, 190.0 / 255.0)
+        (232.0 / 255.0, 234.0 / 255.0, 237.0 / 255.0)
     };
     cr.set_source_rgb(ink.0, ink.1, ink.2);
     cr.move_to(cx - 4.5, cy - 2.25 * direction);
@@ -241,6 +221,9 @@ pub fn chevron(cr: &Context, r: Rect, expanded: bool) {
     let _ = cr.restore();
 }
 pub fn status_colored(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, f64, f64)) {
+    status_rgba(cr, r, key, state, (ink.0, ink.1, ink.2, 1.0));
+}
+pub fn status_rgba(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, f64, f64, f64)) {
     let _ = cr.save();
     let size =
         r.w.min(r.h)
@@ -248,7 +231,7 @@ pub fn status_colored(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, 
     cr.translate(r.x + (r.w - size) / 2.0, r.y + (r.h - size) / 2.0);
     cr.scale(size / 24.0, size / 24.0);
     cr.new_path();
-    cr.set_source_rgb(ink.0, ink.1, ink.2);
+    cr.set_source_rgba(ink.0, ink.1, ink.2, ink.3);
     cr.set_line_width(1.65);
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
@@ -839,9 +822,44 @@ mod tests {
         }
     }
     #[test]
-    fn bundled_lucy_logo_loads_without_a_runtime_source_path() {
-        let surface = logo_surface().unwrap();
-        assert_eq!((surface.width(), surface.height()), (64, 64));
+    fn launcher_is_a_centered_nine_tile_grid_inside_the_existing_hit_box() {
+        let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 30, 28).unwrap();
+        {
+            let cr = Context::new(&image).unwrap();
+            launcher(
+                &cr,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 30.0,
+                    h: 28.0,
+                },
+            );
+        }
+        let stride = image.stride() as usize;
+        let bytes = image.data().unwrap();
+        for y in [8, 14, 19] {
+            for x in [9, 15, 20] {
+                assert_eq!(bytes[y * stride + x * 4 + 3], 255);
+            }
+            for x in [12, 17] {
+                assert_eq!(bytes[y * stride + x * 4 + 3], 0);
+            }
+        }
+        let mut bounds = (30, 0, 28, 0);
+        for y in 0..28 {
+            for x in 0..30 {
+                if bytes[y * stride + x * 4 + 3] > 8 {
+                    bounds = (
+                        bounds.0.min(x),
+                        bounds.1.max(x),
+                        bounds.2.min(y),
+                        bounds.3.max(y),
+                    );
+                }
+            }
+        }
+        assert_eq!(bounds, (8, 21, 7, 20));
     }
     #[test]
     fn battery_number_is_live_clamped_and_has_no_percent_suffix() {

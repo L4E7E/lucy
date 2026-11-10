@@ -1,14 +1,15 @@
 use glib::{variant::ObjectPath, ToVariant, Variant};
 use std::{
     collections::{HashMap, HashSet},
-    io::{BufRead, BufReader},
-    process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    sync::{mpsc, Arc},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
+};
+#[cfg(test)]
+use std::{
+    io::{BufRead, BufReader},
+    process::{Command, Stdio},
+    time::Duration,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Domain {
@@ -384,9 +385,8 @@ fn refresh_media_position(media: &mut Media) -> bool {
 
 pub(crate) struct Backend {
     pub(crate) tx: mpsc::Sender<Request>,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) child: Arc<Mutex<Option<Child>>>,
     pub(crate) handles: Vec<thread::JoinHandle<()>>,
+    subscription: Option<crate::audio_backend::AudioSubscription>,
 }
 impl Backend {
     pub(crate) fn start(events: glib::Sender<Event>) -> Self {
@@ -440,64 +440,24 @@ impl Backend {
                 }
             }
         });
-        let stop = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None::<Child>));
-        let stopping = stop.clone();
-        let holder = child.clone();
         let notify = tx.clone();
-        let audio = thread::spawn(move || {
-            while !stopping.load(Ordering::Acquire) {
-                let Ok(mut child) = Command::new("pactl")
-                    .arg("subscribe")
-                    .env("LC_ALL", "C")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                else {
-                    break;
-                };
-                let stdout = child.stdout.take().unwrap();
-                {
-                    let mut slot = holder.lock().unwrap();
-                    if stopping.load(Ordering::Acquire) {
-                        let _ = child.kill();
-                    }
-                    *slot = Some(child);
-                }
-                for line in BufReader::new(stdout).lines() {
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let Ok(line) = line else { break };
-                    if line.contains(" on sink #") || line.contains(" on server #") {
-                        let _ = notify.send(Request::Refresh(Domain::Audio));
-                    }
-                }
-                if let Some(mut child) = holder.lock().unwrap().take() {
-                    let _ = child.wait();
-                }
-                if !stopping.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-        });
+        let subscription = crate::audio_backend::AudioSubscription::new(
+            crate::audio_backend::default_output_event,
+            move || notify.send(Request::Refresh(Domain::Audio)).is_ok(),
+        );
         for domain in DOMAINS {
             let _ = tx.send(Request::Refresh(domain));
         }
         Self {
             tx,
-            stop,
-            child,
-            handles: vec![worker, audio],
+            handles: vec![worker],
+            subscription: Some(subscription),
         }
     }
 }
 impl Drop for Backend {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
-        }
+        self.subscription.take();
         // UI flushes its sliders first. Quit is queued after those final writes.
         let _ = self.tx.send(Request::Quit);
         for handle in self.handles.drain(..) {

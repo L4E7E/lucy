@@ -1,5 +1,7 @@
 //! EGL/glow compositor. Cairo scenes are cached; transition frames stay on GPU.
 use glow::HasContext;
+#[path = "gpu_gauges.rs"]
+mod gauges;
 use std::{
     cell::{Cell, RefCell},
     ffi::{c_char, c_void, CString},
@@ -55,6 +57,23 @@ impl Effect {
         self.slide_direction() != 0.0
     }
 }
+fn overlay_header_fade(overlay: bool, closing: bool, amount: f32) -> f32 {
+    if !overlay {
+        return 0.0;
+    }
+    if !closing {
+        return 1.0;
+    }
+    let t = (amount / 0.45).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+fn calendar_header_return(amount: f32) -> f32 {
+    // Exchange the enlarged HH:MM widget for the full bar date before the
+    // surface is restored. Both cached rasters follow the same geometry curve.
+    let t = (1.0 - amount / 0.55).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub fn spring(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if t >= 1.0 {
@@ -109,13 +128,29 @@ pub fn geometry(effect: Effect, t: f32, notice: bool) -> (f32, f32) {
     }
 }
 pub fn launcher_geometry(effect: Effect, t: f32) -> (f32, f32) {
+    launcher_geometry_from(effect, t, 1.0)
+}
+fn launcher_close_amount(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    // Zero velocity at both endpoints; the surface and its blur share this curve.
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+fn launcher_geometry_from(effect: Effect, t: f32, close_from: f32) -> (f32, f32) {
     if !matches!(effect, Effect::Open | Effect::Close) {
         return (1.0, 0.0);
     }
-    let p = super::expansion::relaxed(t);
-    let amount = if effect == Effect::Close { 1.0 - p } else { p };
-    // Surface geometry also drives the compositor's blur mask, so neither
-    // the material nor its blur gets left behind during the bounded zoom.
+    if effect == Effect::Close {
+        let remaining = launcher_close_amount(t);
+        // Buffer alpha cannot fade Niri's backdrop blur. Shrink the actual
+        // surface to a pixel instead, keeping material, content and blur joined
+        // until destruction; never leave a 94%-sized blur-only rectangle.
+        let start_scale = 0.94 + 0.06 * close_from;
+        return (
+            start_scale * remaining + 0.002 * (1.0 - remaining),
+            12.0 * (1.0 - close_from) + 8.0 * (1.0 - remaining),
+        );
+    }
+    let amount = super::expansion::relaxed(t);
     (0.94 + 0.06 * amount, 12.0 * (1.0 - amount))
 }
 fn shimmer_position(seconds: f32) -> f32 {
@@ -136,7 +171,12 @@ struct Program {
     extent: Option<glow::NativeUniformLocation>,
     header_rect: Option<glow::NativeUniformLocation>,
     header_image: Option<glow::NativeUniformLocation>,
+    clock_previous: Option<glow::NativeUniformLocation>,
+    clock_progress: Option<glow::NativeUniformLocation>,
     header_fade: Option<glow::NativeUniformLocation>,
+    return_image: Option<glow::NativeUniformLocation>,
+    return_width: Option<glow::NativeUniformLocation>,
+    return_blend: Option<glow::NativeUniformLocation>,
     motion_mode: Option<glow::NativeUniformLocation>,
     motion_rect: Option<glow::NativeUniformLocation>,
     list_rect: Option<glow::NativeUniformLocation>,
@@ -158,6 +198,7 @@ pub struct Gpu {
     context: Handle,
     gl: RefCell<Option<glow::Context>>,
     program: RefCell<Option<Program>>,
+    gauge_renderer: RefCell<Option<gauges::Renderer>>,
     _connection: wayland_client::Connection,
 }
 impl Gpu {
@@ -201,6 +242,7 @@ impl Gpu {
                 context,
                 gl: RefCell::new(None),
                 program: RefCell::new(None),
+                gauge_renderer: RefCell::new(None),
                 _connection: connection.clone(),
             }))
         }
@@ -241,7 +283,12 @@ uniform float joined;
 uniform vec4 extent;
 uniform vec4 headerRect;
 uniform sampler2D headerImage;
+uniform sampler2D clockPrevious;
+uniform float clockProgress;
 uniform float headerFade;
+uniform sampler2D returnImage;
+uniform float returnWidth;
+uniform float returnBlend;
 uniform float motionMode;
 uniform vec4 motionRect;
 uniform vec4 listRect;
@@ -350,6 +397,29 @@ void main(){
         base=vec4(vec3(light),light)+base*(1.0-light);
         float rim=(1.0-smoothstep(0.4,1.3,abs(edge+0.9)))*mix(0.40,0.16,uv.y);
         base=vec4(vec3(rim),rim)+base*(1.0-rim);
+        if(extent.y<100.0){
+            // Match draw::bar's material rather than the expanded-panel rim.
+            // Fixed height/radius throughout OSD motion: only width changes.
+            vec2 axis=vec2(extent.x*0.65,extent.y);
+            float g=clamp(dot(pos,axis)/dot(axis,axis),0.0,1.0);
+            vec4 highlight=g<0.48
+                ?mix(vec4(1.0,1.0,1.0,0.115),vec4(0.91,0.95,1.0,0.035),g/0.48)
+                :mix(vec4(0.91,0.95,1.0,0.035),vec4(1.0,1.0,1.0,0.065),(g-0.48)/0.52);
+            vec4 barBase=vec4(vec3(25.0,27.0,34.0)/255.0*0.54,0.54);
+            barBase=vec4(highlight.rgb*highlight.a,highlight.a)+barBase*(1.0-highlight.a);
+            float diagonal=clamp(dot(pos,extent.xy)/dot(extent.xy,extent.xy),0.0,1.0);
+            vec4 crystal=diagonal<0.35
+                ?mix(vec4(1.0,1.0,1.0,0.35),vec4(1.0,1.0,1.0,0.045),diagonal/0.35)
+                :mix(vec4(1.0,1.0,1.0,0.045),vec4(0.86,0.93,1.0,0.17),(diagonal-0.35)/0.65);
+            float line=1.0-smoothstep(0.0,0.8,abs(edge+0.6));
+            float alpha=crystal.a*line;
+            barBase=vec4(crystal.rgb*alpha,alpha)+barBase*(1.0-alpha);
+            float barRim=uv.y<0.45?mix(0.40,0.055,uv.y/0.45):mix(0.055,0.24,(uv.y-0.45)/0.55);
+            alpha=barRim*(1.0-smoothstep(0.0,1.0,abs(edge+0.75)));
+            barBase=vec4(vec3(alpha),alpha)+barBase*(1.0-alpha);
+            // Do not switch materials abruptly at the final 35 -> 34 px frame.
+            base=mix(barBase,base,smoothstep(34.0,100.0,extent.y));
+        }
         vec2 q=(pos-vec2((extent.x-extent.z)*0.5,extent.w<=34.0?0.0:10.0*(1.0-joined)))/extent.zw;
         vec4 body=regional(q);
         if(blending>0.5&&abs(motionMode)<0.5){
@@ -360,8 +430,29 @@ void main(){
         vec4 result=body+base*(1.0-body.a);
         vec2 h=(pos-headerRect.xy)/headerRect.zw;
         if(h.x>=0.0&&h.x<=1.0&&h.y>=0.0&&h.y<=1.0){
-            vec4 ink=texture2D(headerImage,h).bgra*(1.0-headerFade*smoothstep(0.0,0.45,joined));
+            vec4 ink=texture2D(headerImage,h).bgra;
+            if(clockProgress<1.0){
+                // Move only the cached clock ink; material and Niri blur stay still.
+                vec2 entering=h-vec2(0.0,(1.0-clockProgress)*0.12);
+                vec2 leaving=h+vec2(0.0,clockProgress*0.12);
+                vec4 next=texture2D(headerImage,clamp(entering,0.0,1.0)).bgra;
+                vec4 old=texture2D(clockPrevious,clamp(leaving,0.0,1.0)).bgra;
+                next*=step(0.0,entering.y)*step(entering.y,1.0);
+                old*=step(0.0,leaving.y)*step(leaving.y,1.0);
+                ink=mix(old,next,clockProgress);
+            }
+            ink*=(1.0-headerFade)*(1.0-returnBlend);
             result=ink+result*(1.0-ink.a);
+        }
+        if(returnBlend>0.0){
+            // Keep both clock layouts on the same moving center: otherwise
+            // the date appears above a second, fading HH:MM during collapse.
+            vec2 origin=headerRect.xy+headerRect.zw*0.5-vec2(returnWidth,34.0)*0.5;
+            vec2 r=(pos-origin)/vec2(returnWidth,34.0);
+            if(r.x>=0.0&&r.x<=1.0&&r.y>=0.0&&r.y<=1.0){
+                vec4 ink=texture2D(returnImage,r).bgra*returnBlend;
+                result=ink+result*(1.0-ink.a);
+            }
         }
         gl_FragColor=result*mask;return;
     }
@@ -417,7 +508,12 @@ void main(){
             extent: gl.get_uniform_location(native, "extent"),
             header_rect: gl.get_uniform_location(native, "headerRect"),
             header_image: gl.get_uniform_location(native, "headerImage"),
+            clock_previous: gl.get_uniform_location(native, "clockPrevious"),
+            clock_progress: gl.get_uniform_location(native, "clockProgress"),
             header_fade: gl.get_uniform_location(native, "headerFade"),
+            return_image: gl.get_uniform_location(native, "returnImage"),
+            return_width: gl.get_uniform_location(native, "returnWidth"),
+            return_blend: gl.get_uniform_location(native, "returnBlend"),
             motion_mode: gl.get_uniform_location(native, "motionMode"),
             motion_rect: gl.get_uniform_location(native, "motionRect"),
             list_rect: gl.get_uniform_location(native, "listRect"),
@@ -433,6 +529,7 @@ void main(){
             lock_amount: gl.get_uniform_location(native, "lockAmount"),
             lock_texel: gl.get_uniform_location(native, "lockTexel"),
         };
+        *self.gauge_renderer.borrow_mut() = Some(gauges::Renderer::new(&gl)?);
         *self.program.borrow_mut() = Some(program);
         *self.gl.borrow_mut() = Some(gl);
         eprintln!("Lucy EGL + glow renderer: {renderer}");
@@ -457,6 +554,23 @@ struct Header {
     texture: glow::NativeTexture,
     fingerprint: u64,
     width: f32,
+}
+const CLOCK_TURN_MS: u64 = 260;
+struct ClockTurn {
+    previous: Header,
+    start: Instant,
+    last: Cell<f32>,
+}
+impl ClockTurn {
+    fn time(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() / (CLOCK_TURN_MS as f32 / 1000.0)).min(1.0)
+    }
+    fn active(&self) -> bool {
+        self.time() < 1.0 || self.last.get() < 1.0
+    }
+}
+fn clock_should_turn(previous: Option<i64>, minute: i64, settled: bool) -> bool {
+    settled && previous.is_some_and(|old| old != minute)
 }
 struct LockBackdrop {
     texture: glow::NativeTexture,
@@ -498,10 +612,14 @@ pub struct Window {
     last: Cell<f32>,
     active: bool,
     launcher: bool,
+    launcher_close_from: f32,
     lock_backdrop: Option<LockBackdrop>,
     background: f32,
     expansion: Option<super::expansion::Expansion>,
     header: Option<Header>,
+    return_header: Option<Header>,
+    clock_minute: Option<i64>,
+    clock_turn: Option<ClockTurn>,
     osd: bool,
     motion_rect: [f32; 4],
     list_rect: [f32; 4],
@@ -512,6 +630,8 @@ pub struct Window {
     logical_size: (f32, f32),
     shimmer: Option<[f32; 4]>,
     shimmer_start: Instant,
+    gauges: super::gauge::Batch,
+    previous_gauges: super::gauge::Batch,
 }
 impl Window {
     /// The caller keeps wl_surface alive until this wrapper is dropped.
@@ -570,10 +690,14 @@ impl Window {
             last: Cell::new(1.0),
             active: false,
             launcher: false,
+            launcher_close_from: 1.0,
             lock_backdrop: None,
             background: 0.8,
             expansion: None,
             header: None,
+            return_header: None,
+            clock_minute: None,
+            clock_turn: None,
             osd: false,
             motion_rect: [0.0; 4],
             list_rect: [0.0; 4],
@@ -584,6 +708,8 @@ impl Window {
             logical_size: (w as f32, h as f32),
             shimmer: None,
             shimmer_start: Instant::now(),
+            gauges: super::gauge::Batch::default(),
+            previous_gauges: super::gauge::Batch::default(),
         })
     }
     fn current(&self) -> bool {
@@ -598,6 +724,22 @@ impl Window {
     }
     pub fn set_background(&mut self, alpha: f32) {
         self.background = alpha;
+    }
+    pub fn set_gauges(
+        &mut self,
+        specs: Vec<super::gauge::Gauge>,
+        size: (i32, i32),
+        page_changed: bool,
+    ) -> bool {
+        if page_changed {
+            self.previous_gauges = self.gauges.clone();
+            self.previous_gauges.freeze();
+            self.gauges.clear();
+        }
+        self.gauges.update(specs, (size.0 as f32, size.1 as f32))
+    }
+    pub fn gauge_count(&self) -> usize {
+        self.gauges.items.len()
     }
     pub fn set_launcher(&mut self, launcher: bool) {
         self.launcher = launcher;
@@ -684,6 +826,13 @@ impl Window {
         }
     }
     pub fn set_osd(&mut self, osd: bool) {
+        if osd && !self.osd {
+            // Never crossfade an overlay from a cached copy of the clock bar.
+            // The first overlay upload replaces both scene textures.
+            self.fingerprint = None;
+            self.active = false;
+            self.effect = Effect::Immediate;
+        }
         self.osd = osd;
     }
     pub fn set_indicator(&mut self, target: Option<f32>, size: (i32, i32)) {
@@ -746,8 +895,24 @@ impl Window {
         }
     }
     pub fn finish_expansion(&mut self) {
+        self.gauges.clear();
+        self.previous_gauges.clear();
+        self.osd = false;
         self.expansion = None;
-        if let Some(h) = self.header.take() {
+        self.clock_minute = None;
+        if let Some(turn) = self.clock_turn.take() {
+            if self.current() {
+                if let Some(gl) = self.gpu.gl.borrow().as_ref() {
+                    unsafe {
+                        gl.delete_texture(turn.previous.texture);
+                    }
+                }
+            }
+        }
+        for h in [self.header.take(), self.return_header.take()]
+            .into_iter()
+            .flatten()
+        {
             if self.current() {
                 if let Some(gl) = self.gpu.gl.borrow().as_ref() {
                     unsafe {
@@ -761,6 +926,86 @@ impl Window {
         self.effect = Effect::Immediate;
     }
     pub fn set_header(&mut self, bytes: &[u8], w: i32, h: i32, logical_width: f32) -> bool {
+        self.clock_minute = None;
+        self.upload_header(bytes, w, h, logical_width, false)
+    }
+    pub fn set_return_header(&mut self, bytes: &[u8], w: i32, h: i32, width: f32) {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        hash.write(bytes);
+        hash.write_i32(w);
+        hash.write_i32(h);
+        let fingerprint = hash.finish();
+        if self
+            .return_header
+            .as_ref()
+            .is_some_and(|h| h.fingerprint == fingerprint)
+            || !self.current()
+        {
+            return;
+        }
+        let gl = self.gpu.gl.borrow();
+        let gl = gl.as_ref().unwrap();
+        unsafe {
+            let texture = match self.return_header.as_ref() {
+                Some(h) => h.texture,
+                None => match gl.create_texture() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                },
+            };
+            gl.active_texture(glow::TEXTURE5);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            for (name, value) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
+            }
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(bytes)),
+            );
+            self.return_header = Some(Header {
+                texture,
+                fingerprint,
+                width,
+            });
+        }
+    }
+    pub fn set_clock_header(
+        &mut self,
+        bytes: &[u8],
+        w: i32,
+        h: i32,
+        logical_width: f32,
+        minute: i64,
+    ) -> bool {
+        let settled = self
+            .expansion
+            .as_ref()
+            .is_some_and(|e| !e.closing() && !e.animating());
+        let turn = clock_should_turn(self.clock_minute, minute, settled);
+        let changed = self.upload_header(bytes, w, h, logical_width, turn);
+        self.clock_minute = Some(minute);
+        changed
+    }
+    fn upload_header(
+        &mut self,
+        bytes: &[u8],
+        w: i32,
+        h: i32,
+        logical_width: f32,
+        animate: bool,
+    ) -> bool {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         hash.write(bytes);
         hash.write_i32(w);
@@ -777,13 +1022,23 @@ impl Window {
         let gl = self.gpu.gl.borrow();
         let gl = gl.as_ref().unwrap();
         unsafe {
-            let texture = match &self.header {
-                Some(h) => h.texture,
-                None => match gl.create_texture() {
+            let texture = match (&self.header, animate) {
+                (Some(h), false) => h.texture,
+                _ => match gl.create_texture() {
                     Ok(t) => t,
                     Err(_) => return false,
                 },
             };
+            if let Some(turn) = self.clock_turn.take() {
+                gl.delete_texture(turn.previous.texture);
+            }
+            if animate {
+                self.clock_turn = self.header.take().map(|previous| ClockTurn {
+                    previous,
+                    start: Instant::now(),
+                    last: Cell::new(0.0),
+                });
+            }
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             for (name, value) in [
@@ -964,7 +1219,9 @@ impl Window {
         (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
     }
     pub fn animating(&self) -> bool {
-        self.lock_animating()
+        self.gauges.animating()
+            || self.lock_animating()
+            || self.clock_turn.as_ref().is_some_and(ClockTurn::active)
             || self.expanding()
             || self.indicator.as_ref().is_some_and(Indicator::animating)
             || (self.active && (self.t() < 1.0 || self.last.get() < 1.0))
@@ -975,11 +1232,21 @@ impl Window {
             .map_or(self.effect == Effect::Close, |e| e.closing())
     }
     pub fn close(&mut self) {
+        self.gauges.freeze();
         let header = self.header.as_ref().map_or(0.0, |h| h.width);
         if let Some(e) = &mut self.expansion {
             e.close(header);
             self.active = false;
             return;
+        }
+        if self.launcher {
+            // Closing during entry must continue from its current geometry,
+            // rather than snapping back to full size before shrinking again.
+            self.launcher_close_from = if self.effect == Effect::Open {
+                super::expansion::relaxed(self.t())
+            } else {
+                1.0
+            };
         }
         self.effect = Effect::Close;
         self.start = Instant::now();
@@ -989,7 +1256,11 @@ impl Window {
     }
     pub fn geometry(&self, notice: bool) -> (f32, f32) {
         if self.launcher {
-            launcher_geometry(self.effect, self.t())
+            if self.effect == Effect::Close {
+                launcher_geometry_from(self.effect, self.t(), self.launcher_close_from)
+            } else {
+                launcher_geometry(self.effect, self.t())
+            }
         } else {
             geometry(self.effect, self.t(), notice)
         }
@@ -1006,6 +1277,8 @@ impl Window {
         expansion: Option<super::expansion::Frame>,
         #[cfg(test)] inspect: Option<&mut dyn FnMut(&glow::Context, i32, i32)>,
     ) -> bool {
+        #[cfg(test)]
+        let inspect_only = inspect.is_some();
         if !self.current() {
             return false;
         }
@@ -1065,7 +1338,41 @@ impl Window {
                     gl.uniform_1_i32(p.header_image.as_ref(), 2);
                 }
             }
-            gl.uniform_1_f32(p.header_fade.as_ref(), if self.osd { 1.0 } else { 0.0 });
+            gl.uniform_1_f32(
+                p.header_fade.as_ref(),
+                overlay_header_fade(
+                    self.osd,
+                    self.closing(),
+                    expansion.map_or(0.0, |f| f.amount),
+                ),
+            );
+            gl.uniform_1_i32(p.clock_previous.as_ref(), 4);
+            gl.uniform_1_i32(p.return_image.as_ref(), 5);
+            gl.active_texture(glow::TEXTURE5);
+            gl.bind_texture(
+                glow::TEXTURE_2D,
+                self.return_header.as_ref().map(|h| h.texture),
+            );
+            gl.uniform_1_f32(
+                p.return_width.as_ref(),
+                self.return_header.as_ref().map_or(1.0, |h| h.width),
+            );
+            gl.uniform_1_f32(
+                p.return_blend.as_ref(),
+                expansion
+                    .filter(|_| self.return_header.is_some())
+                    .map_or(0.0, |f| calendar_header_return(f.amount)),
+            );
+            let clock_t = self.clock_turn.as_ref().map_or(1.0, ClockTurn::time);
+            gl.uniform_1_f32(
+                p.clock_progress.as_ref(),
+                super::expansion::relaxed(clock_t),
+            );
+            gl.active_texture(glow::TEXTURE4);
+            gl.bind_texture(
+                glow::TEXTURE_2D,
+                self.clock_turn.as_ref().map(|turn| turn.previous.texture),
+            );
             let marker = self
                 .indicator
                 .as_ref()
@@ -1171,12 +1478,67 @@ impl Window {
                 },
             );
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            if let Some(renderer) = self.gpu.gauge_renderer.borrow().as_ref() {
+                let (frame, offset, alpha) = if let Some(f) = expansion {
+                    let target = self.expansion.as_ref().unwrap().target;
+                    let amount = ((f.amount - 0.08) / (0.65 - 0.08)).clamp(0.0, 1.0);
+                    (
+                        (f.size.0 as f32, f.size.1 as f32),
+                        ((f.size.0 - target.0) as f32 * 0.5, 10.0 * (1.0 - f.amount)),
+                        amount * amount * (3.0 - 2.0 * amount),
+                    )
+                } else {
+                    (self.logical_size, (0.0, 0.0), 1.0)
+                };
+                let target = self
+                    .expansion
+                    .as_ref()
+                    .map_or(self.logical_size.0, |e| e.target.0 as f32);
+                let pixel = frame.0 / self.w as f32;
+                let slide = if self.effect.is_slide() && t < 1.0 {
+                    self.effect.slide_direction()
+                } else {
+                    0.0
+                };
+                if slide != 0.0 {
+                    renderer.paint(
+                        gl,
+                        &self.previous_gauges,
+                        frame,
+                        (
+                            offset.0 + target
+                                - self.previous_gauges.size.0
+                                - slide * progress * target,
+                            offset.1,
+                        ),
+                        alpha,
+                        pixel,
+                    );
+                }
+                renderer.paint(
+                    gl,
+                    &self.gauges,
+                    frame,
+                    (
+                        offset.0 + target - self.gauges.size.0 + slide * (1.0 - progress) * target,
+                        offset.1,
+                    ),
+                    alpha,
+                    pixel,
+                );
+            }
             #[cfg(test)]
             if let Some(inspect) = inspect {
                 inspect(gl, self.w, self.h);
             }
+            #[cfg(test)]
+            let ok = inspect_only || eglSwapBuffers(self.gpu.display, self.surface) != 0;
+            #[cfg(not(test))]
             let ok = eglSwapBuffers(self.gpu.display, self.surface) != 0;
             self.last.set(t);
+            if let Some(turn) = &self.clock_turn {
+                turn.last.set(clock_t);
+            }
             if let Some(indicator) = &self.indicator {
                 indicator.last.set(indicator.time());
             }
@@ -1189,8 +1551,100 @@ impl Window {
 }
 #[cfg(test)]
 impl Window {
+    fn verify_calendar_returns_to_the_cached_bar_before_restoration(&mut self) {
+        self.finish_expansion();
+        self.update(&vec![0; 780 * 500 * 4], 780, 500, Effect::Immediate, true);
+        // Red is the enlarged widget; blue is the normal date/time bar.
+        self.set_header(&[0, 0, 255, 255], 1, 1, 90.0);
+        self.set_return_header(&[255, 0, 0, 255], 1, 1, 180.0);
+        self.begin_expansion(180, (780, 500), true, false);
+        for amount in [1.0, 0.75, 0.55, 0.4, 0.2, 0.05, 0.0] {
+            let frame = super::expansion::layout(amount, 180.0, (780, 500), 90.0, true);
+            let blend = calendar_header_return(amount);
+            let mut inspect = |gl: &glow::Context, w: i32, h: i32| {
+                let mut pixel = [0; 4];
+                unsafe {
+                    gl.read_pixels(
+                        ((frame.header.0 + 45.0 * frame.header_scale) / frame.size.0 as f32
+                            * w as f32) as i32,
+                        h - 1
+                            - ((frame.header.1 + 17.0 * frame.header_scale) / frame.size.1 as f32
+                                * h as f32) as i32,
+                        1,
+                        1,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut pixel)),
+                    );
+                }
+                assert!(
+                    f32::from(pixel[2]) + 2.0 >= 255.0 * blend,
+                    "bar ink must appear while shrinking, amount={amount}: {pixel:?}"
+                );
+                if amount == 0.0 {
+                    assert_eq!(
+                        pixel,
+                        [0, 0, 255, 255],
+                        "last joined frame must already contain the normal bar"
+                    );
+                }
+            };
+            assert!(self.present_frame(Some(frame), Some(&mut inspect)));
+        }
+        self.finish_expansion();
+        assert!(
+            self.return_header.is_none(),
+            "release the extra clock texture at idle"
+        );
+        println!("Calendar GPU: normal bar ink appears continuously before restoration; return texture released");
+    }
+    fn verify_overlay_excludes_cached_clock(&mut self) {
+        let old = [0u8, 0, 255, 255].repeat(260 * 34);
+        let osd = [255u8, 0, 0, 255].repeat(260 * 34);
+        for _ in 0..3 {
+            self.finish_expansion();
+            self.update(&old, 260, 34, Effect::Immediate, true);
+            self.set_header(&[0, 0, 255, 255], 1, 1, 180.0);
+            self.begin_expansion(180, (260, 34), false, false);
+            self.set_osd(true);
+            assert!(
+                self.fingerprint.is_none(),
+                "overlay entry must discard old bar rasters"
+            );
+            self.update(&osd, 260, 34, Effect::Immediate, false);
+            for amount in [0.0, 0.1, 0.3, 0.6, 1.0] {
+                // Force the previous scene to be sampled as well as the header.
+                self.effect = Effect::Change;
+                self.active = true;
+                self.start = Instant::now();
+                let frame = super::expansion::layout(amount, 180.0, (260, 34), 180.0, false);
+                let mut inspect = |gl: &glow::Context, _: i32, _: i32| {
+                    let mut pixel = [0u8; 4];
+                    unsafe {
+                        gl.read_pixels(
+                            130,
+                            17,
+                            1,
+                            1,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixel)),
+                        );
+                    }
+                    assert!(
+                        u16::from(pixel[0]) <= u16::from(pixel[2]) + 2,
+                        "old red clock leaked into opening at {amount}: {pixel:?}"
+                    );
+                };
+                assert!(self.present_frame(Some(frame), Some(&mut inspect)));
+            }
+        }
+        self.finish_expansion();
+        println!("OSD GPU: no cached clock pixels across 3 openings and 15 intermediate frames");
+    }
     /// GPU readback is deliberately test-only: never retain a live lock raster.
     pub fn verify_text_copy(&mut self, expected: &[u8], logical: (i32, i32)) {
+        let original_size = (self.w, self.h);
         let check = |window: &Self, frame, label| {
             let mut max_error = 0u8;
             let mut changed = 0usize;
@@ -1238,6 +1692,15 @@ impl Window {
         let frame = super::expansion::layout(1.0, logical.0 as f32, logical, 1.0, false);
         check(self, Some(frame), "notification joined copy");
         self.finish_expansion();
+        self.verify_overlay_excludes_cached_clock();
+        self.verify_calendar_returns_to_the_cached_bar_before_restoration();
+        self.update(
+            expected,
+            original_size.0,
+            original_size.1,
+            Effect::Immediate,
+            true,
+        );
     }
 }
 impl Drop for Window {
@@ -1251,6 +1714,12 @@ impl Drop for Window {
                 if let Some(h) = &self.header {
                     gl.delete_texture(h.texture);
                 }
+                if let Some(h) = &self.return_header {
+                    gl.delete_texture(h.texture);
+                }
+                if let Some(turn) = &self.clock_turn {
+                    gl.delete_texture(turn.previous.texture);
+                }
                 if let Some(b) = &self.lock_backdrop {
                     gl.delete_texture(b.texture);
                 }
@@ -1262,6 +1731,77 @@ impl Drop for Window {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calendar_clock_becomes_the_bar_before_the_last_frame() {
+        assert_eq!(super::calendar_header_return(1.0), 0.0);
+        assert_eq!(super::calendar_header_return(0.55), 0.0);
+        assert_eq!(super::calendar_header_return(0.0), 1.0);
+        assert!(super::calendar_header_return(0.05) > 0.97);
+        let values: Vec<_> = (0..=100)
+            .map(|step| super::calendar_header_return(1.0 - step as f32 / 100.0))
+            .collect();
+        assert!(values.windows(2).all(|v| v[1] >= v[0]));
+        assert!(values.windows(2).all(|v| v[1] - v[0] < 0.03));
+    }
+    #[test]
+    fn opening_overlay_never_reveals_clock_and_only_closing_fades_it_back() {
+        for step in 0..=100 {
+            let amount = step as f32 / 100.0;
+            assert_eq!(super::overlay_header_fade(true, false, amount), 1.0);
+            assert_eq!(super::overlay_header_fade(false, false, amount), 0.0);
+        }
+        assert_eq!(super::overlay_header_fade(true, true, 1.0), 1.0);
+        assert_eq!(super::overlay_header_fade(true, true, 0.0), 0.0);
+        let mut previous = 1.0;
+        for step in (0..=100).rev() {
+            let fade = super::overlay_header_fade(true, true, step as f32 / 100.0);
+            assert!(fade <= previous);
+            previous = fade;
+        }
+    }
+    #[test]
+    fn clock_turns_only_on_a_new_minute_in_an_already_open_calendar() {
+        use super::*;
+        assert!(!clock_should_turn(None, 600, true));
+        assert!(!clock_should_turn(Some(600), 600, true));
+        assert!(!clock_should_turn(Some(600), 601, false));
+        assert!(clock_should_turn(Some(600), 601, true));
+        assert!(clock_should_turn(Some(1439), 1440, true));
+        assert_eq!(CLOCK_TURN_MS, 260);
+    }
+    #[test]
+    fn launcher_close_reduces_surface_and_blur_together_without_reversing() {
+        use super::{launcher_close_amount, launcher_geometry, Effect};
+        let mut previous = 1.0;
+        let mut previous_scale = 1.0;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let amount = launcher_close_amount(t);
+            assert!((0.0..=previous).contains(&amount));
+            let (scale, _) = launcher_geometry(Effect::Close, t);
+            assert!((0.002..=previous_scale).contains(&scale));
+            previous_scale = scale;
+            previous = amount;
+        }
+        let (scale, _) = launcher_geometry(Effect::Close, 1.0);
+        assert_eq!((570.0 * scale).round(), 1.0);
+        assert_eq!((465.0 * scale).round(), 1.0);
+        assert_eq!(launcher_close_amount(0.0), 1.0);
+        assert_eq!(launcher_close_amount(1.0), 0.0);
+        assert!(launcher_close_amount(0.01) > 0.999);
+        assert!(launcher_close_amount(0.99) < 0.001);
+    }
+    #[test]
+    fn launcher_close_during_open_keeps_current_geometry() {
+        use super::{launcher_geometry, launcher_geometry_from, Effect};
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            assert_eq!(
+                launcher_geometry(Effect::Open, t),
+                launcher_geometry_from(Effect::Close, 0.0, super::super::expansion::relaxed(t))
+            );
+        }
+    }
     #[test]
     fn launcher_opens_without_bounce_or_extreme_scaling() {
         use super::*;
@@ -1275,7 +1815,7 @@ mod tests {
             last_y = y;
         }
         assert_eq!(launcher_geometry(Effect::Open, 1.0), (1.0, 0.0));
-        assert_eq!(launcher_geometry(Effect::Close, 1.0), (0.94, 12.0));
+        assert_eq!(launcher_geometry(Effect::Close, 1.0), (0.002, 8.0));
     }
     #[test]
     fn placeholder_light_makes_one_left_to_right_pass_then_reenters_offscreen() {

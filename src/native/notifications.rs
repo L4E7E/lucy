@@ -150,10 +150,25 @@ fn app_icon_name(desktop: &str, app: &str) -> String {
         desktop.trim_end_matches(".desktop").into()
     }
 }
+fn demanded_icons(s: &Shared) -> HashSet<String> {
+    s.live
+        .iter()
+        .chain(&s.history)
+        .map(|n| n.icon_name.clone())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+fn prune_icons(s: &mut Shared) {
+    let wanted = demanded_icons(s);
+    s.icons.retain(|name, _| wanted.contains(name));
+    // Failed lookups are negative cache entries, not permanent session history.
+    s.icons_requested.retain(|name| wanted.contains(name));
+}
 #[allow(deprecated)]
 fn load_icons(shared: &Rc<RefCell<Shared>>) {
     let names: HashSet<String> = {
-        let s = shared.borrow();
+        let mut s = shared.borrow_mut();
+        prune_icons(&mut s);
         s.live
             .iter()
             .chain(&s.history)
@@ -173,7 +188,12 @@ fn load_icons(shared: &Rc<RefCell<Shared>>) {
     rx.attach(None, move |apps| {
         if let Some(shared) = weak.upgrade() {
             let mut s = shared.borrow_mut();
+            let wanted = demanded_icons(&s);
             for app in apps {
+                if !wanted.contains(&app.id) {
+                    s.icons_requested.remove(&app.id);
+                    continue; // A completed older request must not resurrect removed icons.
+                }
                 if let Some(icon) = app.icon {
                     s.icons.insert(app.id, icon);
                 }
@@ -319,6 +339,7 @@ fn refresh(bus: &gio::DBusConnection, state: &Rc<RefCell<Shared>>) {
                 }
                 s.pending = s.pending.saturating_sub(1);
                 if s.pending == 0 {
+                    prune_icons(&mut s);
                     publish(&s);
                     drop(s);
                     load_icons(&shared);
@@ -576,6 +597,50 @@ impl Drop for Monitor {
 mod tests {
     use super::*;
     use glib::variant::ToVariant;
+    #[test]
+    #[allow(deprecated)]
+    fn icon_and_negative_caches_track_only_current_live_and_history_names() {
+        let (tx, _rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+        let mut state = Shared {
+            live: vec![Notice {
+                icon_name: "current".into(),
+                ..Default::default()
+            }],
+            history: vec![],
+            generation: 0,
+            pending: 0,
+            queued: false,
+            error: String::new(),
+            tx,
+            owner: String::new(),
+            hidden: HashSet::new(),
+            modes: vec![],
+            icons: HashMap::new(),
+            icons_requested: HashSet::new(),
+        };
+        for name in ["current".to_owned()]
+            .into_iter()
+            .chain((0..500).map(|i| format!("old-{i}")))
+        {
+            state.icons_requested.insert(name.clone());
+            state.icons.insert(
+                name,
+                super::super::tray::Icon {
+                    bytes: vec![255; 16].into(),
+                    width: 2,
+                    height: 2,
+                },
+            );
+        }
+        prune_icons(&mut state);
+        assert_eq!(state.icons.len(), 1);
+        assert_eq!(state.icons_requested.len(), 1);
+        state.live.clear();
+        prune_icons(&mut state);
+        assert!(state.icons.is_empty());
+        assert!(state.icons_requested.is_empty());
+        assert!(!demanded_icons(&state).contains("current"));
+    }
     #[test]
     fn receipt_labels_use_local_clock_then_elapsed_hours_and_days() {
         let now = glib::DateTime::from_local(2026, 11, 7, 22, 20, 0.0)

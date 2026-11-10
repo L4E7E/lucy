@@ -166,7 +166,16 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
         -1.0,
     );
     click(&mut p, x, scale);
-    let menu = status();
+    let mut menu = status();
+    if !menu["display_controls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["action"].as_str().unwrap().starts_with("Display(Scale("))
+    {
+        p.wheel(x + 466.0, 340.0, 50.0);
+        menu = status();
+    }
     assert!(menu["display_controls"]
         .as_array()
         .unwrap()
@@ -185,7 +194,7 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
     thread::sleep(Duration::from_millis(150));
     let fixture = status();
     assert_eq!(fixture["display"]["outputs"].as_array().unwrap().len(), 2);
-    let rect = control(&fixture, "DisplayDrag(\"eDP-1\", 0.075)")
+    let rect = control(&fixture, "DisplayDrag(\"DP-3\", 0.075)")
         .or_else(|| {
             fixture["display_controls"]
                 .as_array()
@@ -195,20 +204,77 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
                     c["action"]
                         .as_str()
                         .unwrap()
-                        .starts_with("DisplayDrag(\"eDP-1\"")
+                        .starts_with("DisplayDrag(\"DP-3\"")
                 })
                 .map(|c| std::array::from_fn(|i| c["rect"][i].as_f64().unwrap()))
         })
         .unwrap();
-    p.drag(
+    let internal_rect = fixture["display_controls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| {
+            c["action"]
+                .as_str()
+                .unwrap()
+                .starts_with("DisplayDrag(\"eDP-1\"")
+        })
+        .map(|c| std::array::from_fn::<_, 4, _>(|i| c["rect"][i].as_f64().unwrap()))
+        .unwrap();
+    let drag_dx = internal_rect[0] + 3.0 - (rect[0] + rect[2] / 2.0);
+    p.drag_with_preview(
         x + rect[0] + rect[2] / 2.0,
         6.0 + rect[1] + rect[3] / 2.0,
-        -70.0,
+        drag_dx,
         0.0,
+        || {
+            let moving = status();
+            assert_eq!(moving["display"]["dragging"], true);
+            let draft = moving["display"]["snap_preview"]
+                .as_array()
+                .expect("edge must reveal a separate snap ghost");
+            let internal = draft.iter().find(|p| p["name"] == "eDP-1").unwrap();
+            let external = draft.iter().find(|p| p["name"] == "DP-3").unwrap();
+            assert!(internal["x"].as_i64().unwrap() > external["x"].as_i64().unwrap());
+            let unchanged = moving["display"]["draft"].as_array().unwrap();
+            assert_eq!(
+                unchanged.iter().find(|p| p["name"] == "eDP-1").unwrap()["x"],
+                0
+            );
+            let card = moving["display_controls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| {
+                    c["action"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("DisplayDrag(\"DP-3\"")
+                })
+                .unwrap();
+            assert!((card["rect"][2].as_f64().unwrap() - rect[2]).abs() < 0.000001);
+            assert!((card["rect"][3].as_f64().unwrap() - rect[3]).abs() < 0.000001);
+            if let Some(path) = std::env::var_os("LUCY_DISPLAY_SCREENSHOT") {
+                assert!(Command::new("grim")
+                    .args(["-o", name])
+                    .arg(PathBuf::from(path).with_extension("drag.png"))
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        },
     );
     let dragged = status();
+    assert_eq!(dragged["display"]["dragging"], false);
     assert!(!dragged["display"]["draft"].as_array().unwrap().is_empty());
-    assert!(control(&dragged, "DisplayApplyLayout").is_some());
+    let draft = dragged["display"]["draft"].as_array().unwrap();
+    let internal = draft.iter().find(|p| p["name"] == "eDP-1").unwrap();
+    let external = draft.iter().find(|p| p["name"] == "DP-3").unwrap();
+    assert!(internal["x"].as_i64().unwrap() > external["x"].as_i64().unwrap());
+    assert!(
+        control(&dragged, "DisplayApplyLayout").is_some(),
+        "{dragged}"
+    );
     click(&mut p, x, control(&dragged, "DisplayResetLayout").unwrap());
     let reset = status();
     assert!(reset["display"]["draft"].as_array().unwrap().is_empty());
@@ -277,12 +343,15 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
             .success());
     }
     assert_eq!(
-        hardware,
-        Command::new("niri")
-            .args(["msg", "-j", "outputs"])
-            .output()
-            .unwrap()
-            .stdout
+        serde_json::from_slice::<serde_json::Value>(&hardware).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(
+            &Command::new("niri")
+                .args(["msg", "-j", "outputs"])
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .unwrap()
     );
     assert_eq!(status()["surface"], source);
     socket.send_to(b"@preview-media", &server).unwrap();

@@ -1,5 +1,5 @@
-//! Pointer-only layer surfaces share one pixel, stretched by viewporter.
-//! No monitor-sized GTK/Cairo drawing buffers are allocated for outside clicks.
+//! Outside-click surfaces share one pixel. Session backdrops instead carry a
+//! small, pre-blurred snapshot, independent of compositor multi-GPU effects.
 use std::{
     collections::HashMap,
     fs::File,
@@ -33,18 +33,31 @@ pub struct Backdrop {
     wake: UnixStream,
     worker: Option<thread::JoinHandle<()>>,
 }
+pub struct Artwork {
+    pub pixels: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+}
+type Capture = fn(&str) -> Option<Artwork>;
 impl Backdrop {
     pub fn new(namespace: &str, clicked: glib::Sender<()>) -> Result<Self, String> {
-        Self::with_pixel(namespace, clicked, [0; 4])
+        Self::with_pixel(namespace, clicked, [0; 4], None)
     }
-    pub fn session(clicked: glib::Sender<()>) -> Result<Self, String> {
-        // Premultiplied BGRA: a dim scrim, blurred by the compositor.
-        Self::with_pixel("lucy-session-backdrop", clicked, [5, 4, 4, 76])
+    pub fn session(clicked: glib::Sender<()>, capture: Capture) -> Result<Self, String> {
+        // Opaque fallback rather than an unreadable, unblurred desktop on failure.
+        Self::with_pixel(
+            "lucy-session-backdrop",
+            clicked,
+            [17, 14, 14, 255],
+            Some(capture),
+        )
     }
     fn with_pixel(
         namespace: &str,
         clicked: glib::Sender<()>,
         pixel: [u8; 4],
+        capture: Option<Capture>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -65,11 +78,35 @@ impl Backdrop {
                     shell: None,
                     viewporter: None,
                     buffer: None,
+                    artwork: HashMap::new(),
                     outputs: HashMap::new(),
+                    output_names: HashMap::new(),
                     surfaces: HashMap::new(),
                     initialized: false,
                 };
                 queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+                // wl_output.name arrives after binding the registry globals.
+                queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+                // Capture every output before mapping any scrim. Return only byte
+                // vectors across threads; Cairo objects remain thread-local.
+                if let Some(capture) = capture {
+                    state.artwork = thread::scope(|scope| {
+                        let jobs: Vec<_> = state
+                            .output_names
+                            .iter()
+                            .map(|(&id, name)| (id, scope.spawn(move || capture(name))))
+                            .collect();
+                        jobs.into_iter()
+                            .filter_map(|(id, job)| {
+                                let art = job.join().ok().flatten();
+                                if art.is_none() {
+                                    eprintln!("Lucy session: background capture failed for output {id}; using opaque fallback");
+                                }
+                                art.map(|art| (id, art))
+                            })
+                            .collect()
+                    });
+                }
                 if state.compositor.is_none()
                     || state.shm.is_none()
                     || state.shell.is_none()
@@ -103,7 +140,7 @@ impl Backdrop {
                     state.add_surface(id, &qh);
                 }
                 queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-                // Ensure compositor has committed the catcher before GTK maps the popup above it.
+                // Commit the catcher before the popup maps above it.
                 queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
                 let _ = ready.send(Ok(()));
                 while !stopping.load(Ordering::Acquire) {
@@ -170,12 +207,16 @@ struct Surface {
     surface: wl_surface::WlSurface,
     layer: layer::ZwlrLayerSurfaceV1,
     viewport: wp_viewport::WpViewport,
+    buffer: Option<wl_buffer::WlBuffer>,
 }
 impl Drop for Surface {
     fn drop(&mut self) {
         self.layer.destroy();
         self.viewport.destroy();
         self.surface.destroy();
+        if let Some(buffer) = &self.buffer {
+            buffer.destroy();
+        }
     }
 }
 struct State {
@@ -186,7 +227,9 @@ struct State {
     shell: Option<shell::ZwlrLayerShellV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
     buffer: Option<wl_buffer::WlBuffer>,
+    artwork: HashMap<u32, Artwork>,
     outputs: HashMap<u32, wl_output::WlOutput>,
+    output_names: HashMap<u32, String>,
     surfaces: HashMap<u32, Surface>,
     initialized: bool,
 }
@@ -196,6 +239,32 @@ impl State {
             return;
         }
         let surface = self.compositor.as_ref().unwrap().create_surface(qh, ());
+        let buffer = self.artwork.remove(&id).and_then(|art| {
+            let fd =
+                unsafe { libc::memfd_create(c"lucy-session-blur".as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                return None;
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            file.write_all(&art.pixels).ok()?;
+            let pool = self.shm.as_ref()?.create_pool(
+                file.as_fd(),
+                art.pixels.len().try_into().ok()?,
+                qh,
+                (),
+            );
+            let buffer = pool.create_buffer(
+                0,
+                art.width,
+                art.height,
+                art.stride,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            );
+            pool.destroy();
+            Some(buffer)
+        });
         let viewport = self
             .viewporter
             .as_ref()
@@ -232,6 +301,7 @@ impl State {
                 surface,
                 layer,
                 viewport,
+                buffer,
             },
         );
     }
@@ -262,7 +332,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_output" => {
                     state
                         .outputs
-                        .insert(name, registry.bind(name, version.min(3), qh, ()));
+                        .insert(name, registry.bind(name, version.min(4), qh, name));
                     state.add_surface(name, qh);
                 }
                 "wl_seat" => {
@@ -272,6 +342,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             },
             wl_registry::Event::GlobalRemove { name } => {
                 state.surfaces.remove(&name);
+                state.output_names.remove(&name);
                 if let Some(output) = state.outputs.remove(&name) {
                     if wayland_client::Proxy::version(&output) >= 3 {
                         output.release();
@@ -289,7 +360,7 @@ impl Dispatch<layer::ZwlrLayerSurfaceV1, u32> for State {
         event: layer::Event,
         id: &u32,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         match event {
             layer::Event::Configure {
@@ -302,7 +373,15 @@ impl Dispatch<layer::ZwlrLayerSurfaceV1, u32> for State {
                     surface
                         .viewport
                         .set_destination(width.max(1) as i32, height.max(1) as i32);
-                    surface.surface.attach(state.buffer.as_ref(), 0, 0);
+                    if state.namespace == "lucy-session-backdrop" {
+                        let region = state.compositor.as_ref().unwrap().create_region(qh, ());
+                        region.add(0, 0, width.max(1) as i32, height.max(1) as i32);
+                        surface.surface.set_opaque_region(Some(&region));
+                        region.destroy();
+                    }
+                    surface
+                        .surface
+                        .attach(surface.buffer.as_ref().or(state.buffer.as_ref()), 0, 0);
                     surface.surface.damage(0, 0, i32::MAX, i32::MAX);
                     surface.surface.commit();
                 }
@@ -352,11 +431,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     }
 }
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
+delegate_noop!(State: ignore wayland_client::protocol::wl_region::WlRegion);
 delegate_noop!(State: ignore wl_surface::WlSurface);
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
-delegate_noop!(State: ignore wl_output::WlOutput);
+impl Dispatch<wl_output::WlOutput, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        id: &u32,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            state.output_names.insert(*id, name);
+            state.add_surface(*id, qh);
+        }
+    }
+}
 delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore shell::ZwlrLayerShellV1);

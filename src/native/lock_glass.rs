@@ -36,7 +36,7 @@ thread_local! {
 fn samples(scale: f64) -> usize {
     (6.0 / scale).round().clamp(2.0, 4.0) as usize
 }
-const CLOCK_HEIGHT_RATIO: f64 = 1.14;
+pub const CLOCK_HEIGHT_RATIO: f64 = 1.14;
 
 struct GlyphMask {
     alpha: Vec<u8>,

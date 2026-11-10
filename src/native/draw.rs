@@ -5,8 +5,33 @@ use glib::translate::ToGlibPtr;
 use std::f64::consts::PI;
 #[path = "display_ui.rs"]
 pub(super) mod display_ui;
+#[path = "monitor_ui.rs"]
+mod monitor_ui;
 #[path = "power_ui.rs"]
 pub(super) mod power_ui;
+
+thread_local! {
+    static GPU_GAUGES: std::cell::RefCell<Option<Vec<super::gauge::Gauge>>> = const { std::cell::RefCell::new(None) };
+}
+pub struct GaugeCapture(Option<Vec<super::gauge::Gauge>>);
+impl GaugeCapture {
+    pub fn enter() -> Self {
+        Self(GPU_GAUGES.with(|g| g.replace(Some(Vec::new()))))
+    }
+    pub fn take(&self) -> Vec<super::gauge::Gauge> {
+        GPU_GAUGES.with(|g| {
+            g.borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        })
+    }
+}
+impl Drop for GaugeCapture {
+    fn drop(&mut self) {
+        GPU_GAUGES.with(|g| g.replace(self.0.take()));
+    }
+}
 
 pub const WIDTH: i32 = 480;
 pub const HEIGHT: i32 = 500;
@@ -15,14 +40,20 @@ const CONTROL_TILE_HEIGHT: f64 = 100.0;
 pub const SESSION_WIDTH: i32 = 760;
 pub const SESSION_HEIGHT: i32 = 176;
 pub const WIFI_ROW_PITCH: f64 = 68.0;
-pub const CALENDAR_SHIFT: f64 = 40.0;
+pub const CALENDAR_SHIFT: f64 = 54.0;
+const CALENDAR_DATE: Rect = Rect {
+    x: 20.0,
+    y: 78.0,
+    w: 280.0,
+    h: 28.0,
+};
 pub const CALENDAR_GRID: Rect = Rect {
     x: 20.0,
     y: 128.0 + CALENDAR_SHIFT,
     w: 280.0,
     h: 240.0,
 };
-const MINT: (f64, f64, f64) = (142.0 / 255.0, 216.0 / 255.0, 190.0 / 255.0);
+const ACCENT: (f64, f64, f64) = (232.0 / 255.0, 234.0 / 255.0, 237.0 / 255.0);
 const WHITE: (f64, f64, f64) = (0.96, 0.97, 1.0);
 const WIFI_GREEN: (f64, f64, f64) = (0.24, 0.79, 0.42);
 const EXPANDED_INSET: i32 = 24;
@@ -221,7 +252,7 @@ pub fn round(cr: &Context, r: Rect, radius: f64) {
     cr.close_path();
 }
 fn color(cr: &Context, c: (f64, f64, f64), alpha: f64) {
-    let c = if is_glass() && c == MINT { WHITE } else { c };
+    let c = if is_glass() && c == ACCENT { WHITE } else { c };
     cr.set_source_rgba(c.0, c.1, c.2, alpha);
 }
 #[allow(clippy::too_many_arguments)]
@@ -243,7 +274,7 @@ pub fn text(
         bold,
         size,
         align,
-        if tint { MINT } else { (0.95, 0.96, 0.97) },
+        if tint { ACCENT } else { (0.95, 0.96, 0.97) },
     );
 }
 #[allow(clippy::too_many_arguments)]
@@ -366,13 +397,13 @@ fn heading(cr: &Context, font: &str, s: &str, r: Rect) {
     );
 }
 
-fn app_name_layout(cr: &Context, font: &str, name: &str, width: f64) -> pango::Layout {
+fn app_name_layout(cr: &Context, font: &str, name: &str, width: f64, size: f64) -> pango::Layout {
     let key = super::text_cache::Key::new(
         cr,
         font,
         name,
         2,
-        12.0,
+        size,
         (width * f64::from(pango::SCALE)) as i32,
         pango::Alignment::Center,
         pango::Weight::Normal,
@@ -380,7 +411,7 @@ fn app_name_layout(cr: &Context, font: &str, name: &str, width: f64) -> pango::L
     super::text_cache::layout(key, || {
         let layout = super::text_cache::create(cr);
         let mut desc = pango::FontDescription::from_string(font);
-        desc.set_absolute_size(12.0 * f64::from(pango::SCALE));
+        desc.set_absolute_size(size * f64::from(pango::SCALE));
         layout.set_font_description(Some(&desc));
         layout.set_text(name);
         layout.set_width((width * f64::from(pango::SCALE)) as i32);
@@ -391,21 +422,28 @@ fn app_name_layout(cr: &Context, font: &str, name: &str, width: f64) -> pango::L
     })
 }
 fn app_name(cr: &Context, font: &str, name: &str, r: Rect) {
-    app_name_ink(cr, font, name, r, (0.95, 0.96, 0.97));
+    app_name_ink(
+        cr,
+        font,
+        name,
+        r,
+        (0.95, 0.96, 0.97),
+        super::launcher::NAME_SIZE,
+    );
 }
 fn launcher_content(r: Rect) -> (Rect, Rect) {
     (
         Rect {
-            x: r.x + (r.w - 40.0) / 2.0,
+            x: r.x + (r.w - super::launcher::ICON_SIZE) / 2.0,
             y: r.y + 8.0,
-            w: 40.0,
-            h: 40.0,
+            w: super::launcher::ICON_SIZE,
+            h: super::launcher::ICON_SIZE,
         },
         Rect {
             x: r.x + 8.0,
-            y: r.y + 56.0,
+            y: r.y + 16.0 + super::launcher::ICON_SIZE,
             w: r.w - 16.0,
-            h: 32.0,
+            h: super::launcher::NAME_HEIGHT,
         },
     )
 }
@@ -421,15 +459,15 @@ fn control_tile_content(r: Rect, arrow_width: f64) -> (Rect, Rect, Rect) {
             h: 26.0,
         },
         Rect {
-            x: r.x + 2.0,
+            x: r.x + 12.0,
             y: y + 32.0,
-            w: body - 4.0,
+            w: body - 24.0,
             h: 20.0,
         },
         Rect {
-            x: r.x + 2.0,
+            x: r.x + 12.0,
             y: y + 54.0,
-            w: body - 4.0,
+            w: body - 24.0,
             h: 28.0,
         },
     )
@@ -460,8 +498,8 @@ fn wifi_row_layout(y: f64, w: f64) -> (Rect, Rect, Rect, Rect) {
     };
     (icon, name, detail, action)
 }
-fn app_name_ink(cr: &Context, font: &str, name: &str, r: Rect, ink: (f64, f64, f64)) {
-    let layout = app_name_layout(cr, font, name, r.w);
+fn app_name_ink(cr: &Context, font: &str, name: &str, r: Rect, ink: (f64, f64, f64), size: f64) {
+    let layout = app_name_layout(cr, font, name, r.w, size);
     let height: f64 = layout
         .lines_readonly()
         .iter()
@@ -585,7 +623,7 @@ fn spinner(cr: &Context, x: f64, y: f64) {
     cr.new_path();
     let angle = (glib::monotonic_time() % 1_000_000) as f64 / 1_000_000.0 * PI * 2.0;
     cr.arc(x, y, 6.0, angle, angle + PI * 1.4);
-    color(cr, MINT, 1.0);
+    color(cr, ACCENT, 1.0);
     cr.set_line_width(2.0);
     cr.set_line_cap(cairo::LineCap::Round);
     let _ = cr.stroke();
@@ -603,7 +641,7 @@ pub fn gauge(cr: &Context, r: Rect, value: f64) {
         if is_glass() {
             cr.set_source_rgb(1.0, 1.0, 1.0);
         } else {
-            color(cr, MINT, 1.0);
+            color(cr, ACCENT, 1.0);
         }
         let _ = cr.fill();
     }
@@ -723,6 +761,8 @@ impl Paint<'_> {
             device.connected,
         );
         let (icon, mut name, mut detail, action) = wifi_row_layout(y, w);
+        name.w -= 4.0;
+        detail.w -= 4.0;
         if device.paired && !device.connected {
             name.w -= 38.0;
             detail.w -= 38.0;
@@ -1165,11 +1205,20 @@ impl Paint<'_> {
             }
             let _ = self.cr.stroke();
         } else {
+            let inset = if matches!(a, Action::DeviceMenu(_) | Action::Device(_, _)) {
+                14.0
+            } else {
+                0.0
+            };
             text(
                 self.cr,
                 &self.m.font,
                 s,
-                r,
+                Rect {
+                    x: r.x + inset,
+                    w: (r.w - inset * 2.0).max(0.0),
+                    ..r
+                },
                 active,
                 false,
                 0.0,
@@ -1282,7 +1331,7 @@ impl Paint<'_> {
                 },
                 3.0,
             );
-            color(self.cr, MINT, 0.25);
+            color(self.cr, ACCENT, 0.25);
             let _ = self.cr.fill();
         }
         self.label(
@@ -1318,7 +1367,7 @@ impl Paint<'_> {
             );
         }
         if self.m.entry {
-            color(self.cr, MINT, 1.0);
+            color(self.cr, ACCENT, 1.0);
             self.cr.set_line_width(1.0);
             self.cr.move_to(left + cursor_width, y + 10.0);
             self.cr.line_to(left + cursor_width, y + 30.0);
@@ -1530,7 +1579,7 @@ fn calendar_days(cr: &Context, m: &Model, now: &glib::DateTime, year: i32, month
                 };
                 if m.calendar_offset == 0 && day == now.day_of_month() {
                     round(&hc, r, 8.0);
-                    color(&hc, MINT, 0.22);
+                    color(&hc, ACCENT, 0.22);
                     let _ = hc.fill();
                 }
                 text(
@@ -1747,13 +1796,7 @@ fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
             h: 24.0,
         };
         if let Some(icon) = m.notifications.icons.get(&rows[0].icon_name) {
-            if let Ok(image) = cairo::ImageSurface::create_for_data(
-                icon.bytes.clone(),
-                cairo::Format::ARgb32,
-                icon.width,
-                icon.height,
-                icon.width * 4,
-            ) {
+            if let Some(image) = super::image_cache::get(icon) {
                 let _ = cr.save();
                 cr.translate(icon_rect.x, icon_rect.y);
                 cr.scale(
@@ -1766,7 +1809,7 @@ fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
             }
         } else {
             round(cr, icon_rect, 8.0);
-            color(cr, MINT, 0.13);
+            color(cr, ACCENT, 0.13);
             let _ = cr.fill();
             super::icons::status(cr, icon_rect, "notification", "");
         }
@@ -1799,7 +1842,7 @@ fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
             let hot = pointer(m).is_some_and(|(id, px, py)| id == p.id && r.contains(px, py));
             if hot {
                 round(cr, r, 8.0);
-                color(cr, MINT, 0.12);
+                color(cr, ACCENT, 0.12);
                 let _ = cr.fill();
             }
             super::icons::chevron(cr, r, expanded);
@@ -1876,7 +1919,7 @@ fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
             if notice.active {
                 cr.new_path();
                 cr.arc(timestamp.x - 8.0, y + 22.0, 2.0, 0.0, 2.0 * PI);
-                color(cr, MINT, 1.0);
+                color(cr, ACCENT, 1.0);
                 let _ = cr.fill();
             }
             let layout = &bodies[index];
@@ -1966,7 +2009,9 @@ pub const OSD_HEIGHT: i32 = 34;
 pub fn osd_width(cr: &Context, m: &Model) -> i32 {
     // Use the normal clock font, even when called from an expanded panel.
     let clock_width =
-        (measure(cr, &m.font, &clock(&glib::DateTime::now_local().unwrap())) + 24.0).ceil() as i32;
+        (super::header_ui::clock_width(cr, &m.font, &clock(&glib::DateTime::now_local().unwrap()))
+            + 24.0)
+            .ceil() as i32;
     (clock_width + OSD_EXTRA_WIDTH).max(OSD_MIN_WIDTH)
 }
 pub fn osd_ink(cr: &Context, m: &Model, width: f64, height: f64) {
@@ -2115,7 +2160,7 @@ pub fn center_overlay(cr: &Context, m: &Model, window: u32) -> Scene {
     }
 }
 pub fn clock_header(cr: &Context, m: &Model, width: i32) -> Scene {
-    text(
+    super::header_ui::clock(
         cr,
         &m.font,
         &clock(&glib::DateTime::now_local().unwrap()),
@@ -2125,10 +2170,6 @@ pub fn clock_header(cr: &Context, m: &Model, width: i32) -> Scene {
             w: f64::from(width) - 16.0,
             h: 34.0,
         },
-        false,
-        false,
-        0.0,
-        pango::Alignment::Center,
     );
     Scene {
         hits: vec![],
@@ -2199,13 +2240,7 @@ pub fn notice_popup(cr: &Context, m: &Model, window: u32, id: u32, height: i32) 
             h: 24.0,
         };
         if let Some(icon) = m.notifications.icons.get(&n.icon_name) {
-            if let Ok(image) = cairo::ImageSurface::create_for_data(
-                icon.bytes.clone(),
-                cairo::Format::ARgb32,
-                icon.width,
-                icon.height,
-                icon.width * 4,
-            ) {
+            if let Some(image) = super::image_cache::get(icon) {
                 let _ = cr.save();
                 cr.translate(icon_rect.x, icon_rect.y);
                 cr.scale(24.0 / f64::from(icon.width), 24.0 / f64::from(icon.height));
@@ -2329,26 +2364,19 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
     }
     let width = popup_width(m);
     if !JOINED.with(|v| v.get()) {
-        round(
-            cr,
-            Rect {
+        let render = |cr: &Context| {
+            let r = Rect {
                 x: 0.0,
                 y: 0.0,
                 w: f64::from(width),
                 h: f64::from(height),
-            },
-            PANEL_RADIUS,
-        );
-        glass_base(
-            cr,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: f64::from(width),
-                h: f64::from(height),
-            },
-            0.54,
-        );
+            };
+            round(cr, r, PANEL_RADIUS);
+            glass_base(cr, r, 0.54);
+        };
+        if !super::material_cache::paint(cr, width, height, render) {
+            render(cr);
+        }
     }
     let mut p = Paint {
         cr,
@@ -2377,7 +2405,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
         let left = search.x + 12.0 - (cursor - (search.w - 36.0)).max(0.0);
         if m.launcher.selected_all {
             cr.rectangle(left, 28.0, measure(cr, &m.font, query), 24.0);
-            color(cr, MINT, 0.25);
+            color(cr, ACCENT, 0.25);
             let _ = cr.fill();
         }
         if query.is_empty() && m.preedit.is_empty() {
@@ -2399,7 +2427,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             super::text_cache::show(cr, &layout);
         }
         if let Some(caret) = caret {
-            color(cr, MINT, 1.0);
+            color(cr, ACCENT, 1.0);
             cr.set_line_width(1.0);
             cr.move_to(left + caret, 30.0);
             cr.line_to(left + caret, 50.0);
@@ -2409,7 +2437,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
         p.hit(search, Action::Search, "앱 검색");
         let apps = m.launcher.results();
         content = apps.len().div_ceil(5) as f64 * super::launcher::ROW_HEIGHT;
-        viewport = f64::from(height) - 100.0;
+        viewport = f64::from(height) - 80.0 - super::launcher::LIST_BOTTOM;
         p.clip = Some(Rect {
             x: 20.0,
             y: 80.0,
@@ -2427,9 +2455,9 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             }
             let r = Rect {
                 x: x + (super::launcher::CELL_WIDTH - 92.0) / 2.0,
-                y: y + (super::launcher::ROW_HEIGHT - 96.0) / 2.0,
+                y: y + (super::launcher::ROW_HEIGHT - super::launcher::TILE_HEIGHT) / 2.0,
                 w: 92.0,
-                h: 96.0,
+                h: super::launcher::TILE_HEIGHT,
             };
             let (icon_rect, name_rect) = launcher_content(r);
             let selected = m.launcher.keyboard_focus && m.launcher.selected == index;
@@ -2437,13 +2465,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 crystal(cr, r, 16.0, selected);
             }
             if let Some(icon) = &app.icon {
-                if let Ok(image) = cairo::ImageSurface::create_for_data(
-                    icon.bytes.clone(),
-                    cairo::Format::ARgb32,
-                    icon.width,
-                    icon.height,
-                    icon.width * 4,
-                ) {
+                if let Some(image) = super::image_cache::get(icon) {
                     let _ = cr.save();
                     cr.translate(icon_rect.x, icon_rect.y);
                     cr.scale(
@@ -2623,6 +2645,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 } else {
                     (0.70, 0.72, 0.76)
                 },
+                12.0,
             );
             p.hit(Rect { w: body_w, ..r }, a, "클릭하여 전환");
             let arrow = Rect {
@@ -2670,13 +2693,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 h: 20.0,
             };
             if let Some(icon) = &m.media_app_icon {
-                if let Ok(image) = cairo::ImageSurface::create_for_data(
-                    icon.bytes.clone(),
-                    cairo::Format::ARgb32,
-                    icon.width,
-                    icon.height,
-                    icon.width * 4,
-                ) {
+                if let Some(image) = super::image_cache::get(icon) {
                     let _ = cr.save();
                     cr.translate(icon_rect.x, icon_rect.y);
                     cr.scale(
@@ -2949,6 +2966,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 Page::Bluetooth => "블루투스",
                 Page::Power => "전원",
                 Page::Display => "디스플레이",
+                Page::System => "시스템 모니터",
                 Page::Session => "전원",
                 Page::TrayMenu => "",
                 Page::Calendar => "",
@@ -2966,6 +2984,9 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             },
         );
         match m.page {
+            Page::System => {
+                (content, viewport) = p.monitor_page(height);
+            }
             Page::Display => {
                 (content, viewport) = p.display_page(height);
             }
@@ -3632,21 +3653,32 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                     h: 34.0 * f64::from(super::expansion::CLOCK_SCALE),
                 };
                 if !JOINED.with(|v| v.get()) {
-                    text(
+                    let mut font = pango::FontDescription::from_string(&m.font);
+                    font.set_weight(pango::Weight::Medium);
+                    font.set_absolute_size(
+                        super::expansion::CALENDAR_CLOCK_SIZE * f64::from(pango::SCALE),
+                    );
+                    super::header_ui::clock(
                         cr,
-                        &m.font,
+                        &font.to_string(),
                         &glib::DateTime::now_local()
                             .unwrap()
                             .format("%H:%M")
                             .unwrap(),
                         widget,
-                        false,
-                        true,
-                        super::expansion::CALENDAR_CLOCK_SIZE,
-                        pango::Alignment::Center,
                     );
                 }
                 let now = glib::DateTime::now_local().unwrap();
+                text(
+                    cr,
+                    &m.font,
+                    &calendar_date(&now),
+                    CALENDAR_DATE,
+                    false,
+                    false,
+                    18.0,
+                    pango::Alignment::Center,
+                );
                 let total = now.year() * 12 + now.month() - 1 + m.calendar_offset;
                 let year = total.div_euclid(12);
                 let month = total.rem_euclid(12) + 1;
@@ -3736,7 +3768,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             },
             1.5,
         );
-        color(cr, MINT, if hot { 0.85 } else { 0.55 });
+        color(cr, ACCENT, if hot { 0.85 } else { 0.55 });
         let _ = cr.fill();
         p.hit(track, Action::Scrollbar(bar), "");
     }
@@ -3755,16 +3787,7 @@ fn session(cr: &Context, m: &Model, id: u32) -> Scene {
         hits: vec![],
         clip: None,
     };
-    for (index, (name, command, icon)) in [
-        ("잠금", "lock", "lock"),
-        ("절전", "suspend", "sleep"),
-        ("로그아웃", "logout", "logout"),
-        ("다시 시작", "reboot", "restart"),
-        ("전원 끄기", "poweroff", "power"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, (name, command, icon)) in super::model::SESSION_ACTIONS.into_iter().enumerate() {
         let r = Rect {
             x: 48.0 + index as f64 * 136.0,
             y: 28.0,
@@ -3775,6 +3798,21 @@ fn session(cr: &Context, m: &Model, id: u32) -> Scene {
         cr.set_source_rgba(25.0 / 255.0, 27.0 / 255.0, 34.0 / 255.0, 0.48);
         let _ = cr.fill();
         crystal(cr, r, 28.0, p.hot());
+        text_ink(
+            cr,
+            &m.font,
+            &(index + 1).to_string(),
+            Rect {
+                x: r.x + 14.0,
+                y: r.y + 9.0,
+                w: 20.0,
+                h: 18.0,
+            },
+            false,
+            10.0,
+            pango::Alignment::Left,
+            (0.75, 0.78, 0.82),
+        );
         let _ = cr.save();
         cr.translate(r.x + (r.w - 36.0) / 2.0, r.y + 24.0);
         cr.scale(2.0, 2.0);
@@ -3910,13 +3948,11 @@ pub fn glass_expanded_fallback(
     scene.hits.extend(hs.hits);
     scene
 }
-fn controls_width(_cr: &Context, m: &Model) -> f64 {
+fn controls_width(cr: &Context, m: &Model) -> f64 {
     100.0
-        + if m.metrics.values.contains_key("battery") {
-            44.0
-        } else {
-            0.0
-        }
+        + m.metrics.values.get("battery").map_or(0.0, |metric| {
+            super::icons::width(cr, &m.font, "battery", &metric.text)
+        })
 }
 fn bar_content_width(cr: &Context, m: &Model, side: &str, output: &str) -> i32 {
     match side {
@@ -3927,21 +3963,18 @@ fn bar_content_width(cr: &Context, m: &Model, side: &str, output: &str) -> i32 {
                     .filter(|w| w["output"] == output)
                     .count() as i32
         }
-        "center" => (measure(
+        "center" => (super::header_ui::clock_width(
             cr,
             &clock_font(m),
             &header_clock(m, &glib::DateTime::now_local().unwrap()),
         ) + 24.0)
             .ceil() as i32,
         _ => {
-            let n = ["temperature", "cpu", "memory", "disk"]
-                .iter()
-                .filter_map(|k| m.metrics.values.get(k).map(|metric| (*k, metric)))
-                .map(|(key, metric)| super::icons::width(cr, &m.font, key, &metric.text) + 6.0)
-                .sum::<f64>();
-            (n + 48.0
+            let n = super::header_ui::stats_width(cr, &m.font, &m.metrics);
+            (n + 56.0
                 + controls_width(cr, m)
-                + m.tray_progress() * m.tray_items.len() as f64 * 32.0) as i32
+                + m.tray_progress() * m.tray_items.len() as f64 * 32.0)
+                .round() as i32
         }
     }
 }
@@ -3965,6 +3998,7 @@ fn clock_font(m: &Model) -> String {
     if JOINED.with(|v| v.get()) {
         font.set_weight(pango::Weight::Bold);
         if m.page == Page::Calendar {
+            font.set_weight(pango::Weight::Medium);
             font.set_absolute_size(
                 super::expansion::CALENDAR_CLOCK_SIZE / f64::from(super::expansion::CLOCK_SCALE)
                     * f64::from(pango::SCALE),
@@ -4032,7 +4066,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
             w: 30.0,
             h: 28.0,
         };
-        super::icons::logo(cr, launcher);
+        super::icons::launcher(cr, launcher);
         p.hit(launcher, Action::Launch, "앱 런처");
         let mut x = 44.0;
         let mut workspaces: Vec<_> = m
@@ -4087,7 +4121,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
         }
         let now = glib::DateTime::now_local().unwrap();
         let date = header_clock(m, &now);
-        text(
+        super::header_ui::clock(
             cr,
             &clock_font(m),
             &date,
@@ -4097,10 +4131,6 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
                 w: f64::from(width) - 16.0,
                 h: 34.0,
             },
-            false,
-            false,
-            0.0,
-            pango::Alignment::Center,
         );
         p.hit(
             Rect {
@@ -4114,54 +4144,20 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
         );
     } else {
         let mut x = 10.0 + f64::from(width - bar_content_width(cr, m, side, output)) / 2.0;
-        for key in ["temperature", "cpu", "memory", "disk"] {
-            if let Some(metric) = m.metrics.values.get(key) {
-                if metric.critical {
-                    cr.arc(x + 3.0, 29.0, 2.0, 0.0, 2.0 * PI);
-                    color(cr, WHITE, 1.0);
-                    let _ = cr.fill();
-                }
-                let w = super::icons::width(cr, &m.font, key, &metric.text);
-                if key == "battery" {
-                    super::icons::battery(
-                        cr,
-                        &m.font,
-                        Rect {
-                            x,
-                            y: 0.0,
-                            w,
-                            h: 34.0,
-                        },
-                        super::icons::battery_level(&metric.text),
-                        metric.text.starts_with("󰂄") || metric.tooltip == "Charging",
-                    );
-                } else {
-                    super::icons::status(
-                        cr,
-                        Rect {
-                            x,
-                            y: 0.0,
-                            w: 24.0,
-                            h: 34.0,
-                        },
-                        key,
-                        &metric.text,
-                    );
-                    p.label(
-                        super::icons::value(&metric.text),
-                        Rect {
-                            x: x + 24.0,
-                            y: 0.0,
-                            w: w - 24.0,
-                            h: 34.0,
-                        },
-                        false,
-                        false,
-                    );
-                }
-                x += w + 6.0;
-            }
+        let stats = Rect {
+            x: x - 4.0,
+            y: 3.0,
+            w: super::header_ui::stats_width(cr, &m.font, &m.metrics) + 8.0,
+            h: 28.0,
+        };
+        if stats.w > 8.0 {
+            round(cr, stats, 8.0);
+            color(cr, ACCENT, if p.hot() { 0.18 } else { 0.0 });
+            let _ = cr.fill();
+            p.hit(stats, Action::Page(Page::System), "시스템 모니터");
         }
+        x += super::header_ui::stats(cr, &m.font, &m.metrics, x);
+        x += 8.0;
         let group = Rect {
             x,
             y: 3.0,
@@ -4169,7 +4165,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
             h: 28.0,
         };
         round(cr, group, 8.0);
-        color(cr, MINT, if p.hot() { 0.18 } else { 0.0 });
+        color(cr, ACCENT, if p.hot() { 0.18 } else { 0.0 });
         let _ = cr.fill();
         let audio = m
             .metrics
@@ -4205,7 +4201,9 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
                 cr,
                 &m.font,
                 Rect {
-                    x: x + 96.0,
+                    // Battery body center is 20px into its canvas; other icons use 12px.
+                    // Keep all four control centers 32px apart.
+                    x: x + 93.0,
                     y: 0.0,
                     w: 44.0,
                     h: 34.0,
@@ -4227,13 +4225,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
                     h: 24.0,
                 };
                 if let Some(icon) = &item.icon {
-                    if let Ok(image) = cairo::ImageSurface::create_for_data(
-                        icon.bytes.clone(),
-                        cairo::Format::ARgb32,
-                        icon.width,
-                        icon.height,
-                        icon.width * 4,
-                    ) {
+                    if let Some(image) = super::image_cache::get(icon) {
                         let _ = cr.save();
                         let size = 18.0 * (0.80 + 0.20 * tray_progress);
                         cr.translate(r.x + (24.0 - size) / 2.0, r.y + (24.0 - size) / 2.0);
@@ -4271,7 +4263,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
             };
             if p.hot() {
                 round(cr, r, 7.0);
-                color(cr, MINT, 0.15);
+                color(cr, ACCENT, 0.15);
                 let _ = cr.fill();
             }
             let _ = cr.save();
@@ -4321,17 +4313,28 @@ fn clock(now: &glib::DateTime) -> String {
         "{:02}월 {:02}일 {} {:02}:{:02}",
         now.month(),
         now.day_of_month(),
-        [
-            "월요일",
-            "화요일",
-            "수요일",
-            "목요일",
-            "금요일",
-            "토요일",
-            "일요일"
-        ][(now.day_of_week() - 1) as usize],
+        korean_weekday(now),
         now.hour(),
         now.minute()
+    )
+}
+fn korean_weekday(now: &glib::DateTime) -> &'static str {
+    [
+        "월요일",
+        "화요일",
+        "수요일",
+        "목요일",
+        "금요일",
+        "토요일",
+        "일요일",
+    ][(now.day_of_week() - 1) as usize]
+}
+fn calendar_date(now: &glib::DateTime) -> String {
+    format!(
+        "{}월 {}일 {}",
+        now.month(),
+        now.day_of_month(),
+        korean_weekday(now)
     )
 }
 
@@ -4422,6 +4425,7 @@ mod tests {
         calendar.page = Page::Calendar;
         let _joined = JoinedScope::enter();
         let expanded = pango::FontDescription::from_string(&clock_font(&calendar));
+        assert_eq!(expanded.weight(), pango::Weight::Medium);
         let pixels = f64::from(expanded.size()) / f64::from(pango::SCALE)
             * f64::from(crate::expansion::CLOCK_SCALE);
         assert!((pixels - crate::expansion::CALENDAR_CLOCK_SIZE).abs() < 0.01);
@@ -4498,7 +4502,7 @@ mod tests {
             icon_name: String::new(),
             menu: String::new(),
             icon: Some(super::super::tray::Icon {
-                bytes: [0, 0, 255, 255].repeat(4),
+                bytes: [0, 0, 255, 255].repeat(4).into(),
                 width: 2,
                 height: 2,
             }),
@@ -4779,6 +4783,7 @@ mod tests {
             Page::Bluetooth,
             Page::Power,
             Page::Display,
+            Page::System,
             Page::Calendar,
         ] {
             m.navigate(page);
@@ -5133,15 +5138,17 @@ mod tests {
         let mut m = Model::new();
         m.navigate(Page::Launcher);
         m.launcher.keyboard_focus = true;
-        m.launcher.apps = (0..2)
-            .map(|id| super::super::launcher::App {
-                id: id.to_string(),
-                name: "App".into(),
-                search: "app".into(),
-                icon_name: String::new(),
-                icon: None,
-            })
-            .collect();
+        m.launcher.set_apps(
+            (0..2)
+                .map(|id| super::super::launcher::App {
+                    id: id.to_string(),
+                    name: "App".into(),
+                    search: "app".into(),
+                    icon_name: String::new(),
+                    icon: None,
+                })
+                .collect(),
+        );
         let mut image =
             cairo::ImageSurface::create(cairo::Format::ARgb32, super::super::launcher::WIDTH, 560)
                 .unwrap();
@@ -5163,6 +5170,35 @@ mod tests {
         let idle = rim(tiles[1].rect);
         assert!(selected > idle + 20);
         assert!(selected < 255);
+    }
+    #[test]
+    fn cached_popup_glass_keeps_exact_pixels_at_both_output_scales() {
+        for scale in [1.0, 1.5, 2.0] {
+            let (w, h) = ((480.0 * scale) as i32, (400.0 * scale) as i32);
+            let mut direct = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+            let mut cached = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+            let render = |cr: &Context| {
+                let r = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 480.0,
+                    h: 400.0,
+                };
+                round(cr, r, PANEL_RADIUS);
+                glass_base(cr, r, 0.54);
+            };
+            {
+                let cr = Context::new(&direct).unwrap();
+                cr.scale(scale, scale);
+                render(&cr);
+            }
+            {
+                let cr = Context::new(&cached).unwrap();
+                cr.scale(scale, scale);
+                assert!(super::super::material_cache::paint(&cr, 480, 400, render));
+            }
+            assert_eq!(&*direct.data().unwrap(), &*cached.data().unwrap());
+        }
     }
     #[test]
     fn collapsed_stack_tail_has_no_end_of_animation_jump() {
@@ -5218,7 +5254,7 @@ mod tests {
                     " 50%",
                 );
             }
-            super::super::icons::logo(
+            super::super::icons::launcher(
                 &cr,
                 Rect {
                     x: 240.0,
@@ -5382,6 +5418,59 @@ mod tests {
         assert_eq!(icon.w, 26.0);
         assert_eq!(icon.h, 26.0);
         assert_eq!(icon.y - r.y, 9.0);
+        assert_eq!(detail.x - r.x, 12.0);
+        assert_eq!(r.x + r.w - 34.0 - detail.x - detail.w, 12.0);
+    }
+    #[test]
+    fn long_audio_device_labels_leave_clear_space_inside_button_rims() {
+        let m = Model::new();
+        for action in [
+            Action::DeviceMenu("sink".into()),
+            Action::Device("source".into(), "test".into()),
+        ] {
+            let render = |label: &str| {
+                let mut image =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 50).unwrap();
+                {
+                    let cr = Context::new(&image).unwrap();
+                    let mut p = Paint {
+                        cr: &cr,
+                        m: &m,
+                        id: 1,
+                        hits: vec![],
+                        clip: None,
+                    };
+                    p.button(
+                        Rect {
+                            x: 20.0,
+                            y: 8.0,
+                            w: 432.0,
+                            h: 34.0,
+                        },
+                        label,
+                        action.clone(),
+                        false,
+                        "",
+                    );
+                }
+                let stride = image.stride() as usize;
+                let data = image.data().unwrap().to_vec();
+                (data, stride)
+            };
+            let (empty, stride) = render("");
+            let (long, _) = render(&"아주 긴 Bluetooth Audio Device Name ".repeat(10));
+            assert_ne!(empty, long);
+            for y in 8..42 {
+                for x in (20..32).chain(440..452) {
+                    let start = y * stride + x * 4;
+                    assert_eq!(
+                        &empty[start..start + 4],
+                        &long[start..start + 4],
+                        "text touched button padding at {x},{y}"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn home_tiles_keep_room_for_larger_content_and_separate_detail_arrows() {
@@ -5489,14 +5578,14 @@ mod tests {
         let bytes = image.data().unwrap();
         // The clock lives in its own animated header texture. Its body area
         // must remain transparent, without a second rounded plate underneath.
-        for y in 20..90 {
+        for y in 20..CALENDAR_DATE.y as usize {
             for x in 20..300 {
                 assert_eq!(bytes[y * stride + x * 4 + 3], 0);
             }
         }
     }
     #[test]
-    fn expanded_calendar_clock_has_no_date_but_the_collapsed_bar_keeps_it() {
+    fn calendar_today_caption_is_separate_from_the_animated_clock() {
         let mut m = Model::new();
         m.page = Page::Calendar;
         let now = glib::DateTime::from_local(2026, 11, 7, 22, 20, 0.0).unwrap();
@@ -5508,15 +5597,38 @@ mod tests {
         let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 780, 500).unwrap();
         let cr = Context::new(&image).unwrap();
         let scene = expanded(&cr, &m, 1, 780);
+        assert_eq!(CALENDAR_DATE.x + CALENDAR_DATE.w / 2.0, 160.0);
+        assert!(CALENDAR_DATE.y + CALENDAR_DATE.h + 12.0 <= 64.0 + CALENDAR_SHIFT);
+        assert!(CALENDAR_DATE.y + CALENDAR_DATE.h < CALENDAR_GRID.y);
         for h in scene
             .hits
             .iter()
             .filter(|h| matches!(h.action, Action::CalendarOffset(_)))
         {
-            assert_eq!(h.rect.y, 104.0);
+            assert_eq!(h.rect.y, 64.0 + CALENDAR_SHIFT);
             assert!(
                 h.rect.y > 94.0,
                 "month navigation must stay below the clock widget"
+            );
+        }
+    }
+    #[test]
+    fn calendar_today_caption_uses_korean_weekdays_without_leading_zeroes() {
+        let date = |month, day| glib::DateTime::from_local(2026, month, day, 12, 0, 0.0).unwrap();
+        assert_eq!(calendar_date(&date(11, 10)), "11월 10일 화요일");
+        assert_eq!(calendar_date(&date(1, 5)), "1월 5일 월요일");
+        for (day, weekday) in (1..=7).zip([
+            "일요일",
+            "월요일",
+            "화요일",
+            "수요일",
+            "목요일",
+            "금요일",
+            "토요일",
+        ]) {
+            assert_eq!(
+                calendar_date(&date(11, day)),
+                format!("11월 {day}일 {weekday}")
             );
         }
     }
@@ -5648,6 +5760,7 @@ mod tests {
                 "Sans 11",
                 "Very long application name with several more words",
                 94.0,
+                super::super::launcher::NAME_SIZE,
             );
             assert!(layout.line_count() > 2);
             assert_eq!(layout.ellipsize(), pango::EllipsizeMode::None);
@@ -5752,14 +5865,20 @@ mod tests {
         let scene = bar(&cr, &m, 1, "right", "", width);
         assert_eq!(
             scene.hits.len(),
-            2,
-            "system information must have no click targets"
+            3,
+            "system information opens its own panel, separately from the controls"
         );
+        let monitor = scene
+            .hits
+            .iter()
+            .find(|h| matches!(h.action, Action::Page(Page::System)))
+            .unwrap();
         let group = scene
             .hits
             .iter()
             .find(|h| matches!(h.action, Action::Page(Page::Home)))
             .unwrap();
+        assert!(monitor.rect.x + monitor.rect.w <= group.rect.x);
         assert_eq!(
             group.rect.w, 144.0,
             "battery belongs to the same hover and click group"
@@ -5817,15 +5936,17 @@ mod tests {
     fn launcher_is_five_columns_with_scroll_clipped_hit_boxes() {
         let mut m = Model::new();
         m.navigate(Page::Launcher);
-        for i in 0..40 {
-            m.launcher.apps.push(super::super::launcher::App {
-                id: format!("test{i:02}"),
-                name: format!("App {i:02}"),
-                search: format!("app {i:02}"),
-                icon_name: String::new(),
-                icon: None,
-            });
-        }
+        m.launcher.set_apps(
+            (0..40)
+                .map(|i| super::super::launcher::App {
+                    id: format!("test{i:02}"),
+                    name: format!("App {i:02}"),
+                    search: format!("app {i:02}"),
+                    icon_name: String::new(),
+                    icon: None,
+                })
+                .collect(),
+        );
         let s =
             cairo::ImageSurface::create(cairo::Format::ARgb32, popup_width(&m), popup_height(&m))
                 .unwrap();
@@ -5837,18 +5958,23 @@ mod tests {
             .filter(|h| matches!(h.action, Action::App(_)))
             .collect();
         assert_eq!(apps.len(), 20);
-        assert!(apps[..5].iter().all(|h| h.rect.y == 87.0));
+        assert!(apps[..5].iter().all(|h| h.rect.y == 84.0));
         assert!(apps
             .iter()
             .take(15)
-            .all(|h| h.rect.w == 92.0 && h.rect.h == 96.0));
-        assert_eq!(apps[5].rect.y - apps[0].rect.y, 110.0);
-        assert_eq!(apps[1].rect.x - apps[0].rect.x, 106.0);
-        assert_eq!(apps[1].rect.x - apps[0].rect.x - apps[0].rect.w, 14.0);
-        assert_eq!(apps[5].rect.y - apps[0].rect.y - apps[0].rect.h, 14.0);
+            .all(|h| h.rect.w == 92.0 && h.rect.h == super::super::launcher::TILE_HEIGHT));
+        assert_eq!(apps[5].rect.y - apps[0].rect.y, 116.0);
+        assert_eq!(apps[1].rect.x - apps[0].rect.x, 112.0);
+        assert_eq!(apps[1].rect.x - apps[0].rect.x - apps[0].rect.w, 20.0);
+        assert_eq!(apps[5].rect.y - apps[0].rect.y - apps[0].rect.h, 8.0);
+        assert_eq!(
+            apps[0].rect.x,
+            f64::from(popup_width(&m)) - apps[4].rect.x - apps[4].rect.w,
+            "keep the outer horizontal margins balanced"
+        );
         assert!(apps[5].rect.y > apps[0].rect.y);
         assert!(scene.content_height > scene.viewport_height);
-        let bottom = f64::from(popup_height(&m)) - 20.0;
+        let bottom = f64::from(popup_height(&m)) - super::super::launcher::LIST_BOTTOM;
         assert!(apps
             .iter()
             .all(|h| h.rect.y >= 80.0 && h.rect.y + h.rect.h <= bottom));
@@ -5865,9 +5991,42 @@ mod tests {
             x: 24.0,
             y: 84.0,
             w: 92.0,
-            h: 96.0,
+            h: super::super::launcher::TILE_HEIGHT,
         };
         let (icon, name) = launcher_content(r);
+        assert_eq!((icon.w, icon.h), (48.0, 48.0));
+        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 160).unwrap();
+        let cr = Context::new(&image).unwrap();
+        let label = app_name_layout(
+            &cr,
+            "Sans 11",
+            "App name",
+            name.w,
+            super::super::launcher::NAME_SIZE,
+        );
+        let detail = app_name_layout(&cr, "Sans 11", "App name", name.w, 12.0);
+        assert_eq!(label.font_description().unwrap().size(), 13 * pango::SCALE);
+        assert_eq!(detail.font_description().unwrap().size(), 12 * pango::SCALE);
+        for font in ["Sans 11", "Pretendard JP Medium 11"] {
+            for title in [
+                "Advanced Network",
+                "블루투스 관리자",
+                "Application with a longer name",
+            ] {
+                let label =
+                    app_name_layout(&cr, font, title, name.w, super::super::launcher::NAME_SIZE);
+                let height: i32 = label
+                    .lines_readonly()
+                    .iter()
+                    .take(2)
+                    .map(|line| line.pixel_extents().1.height())
+                    .sum();
+                assert!(
+                    f64::from(height) <= name.h,
+                    "{font}: two lines of {title:?} need {height}px"
+                );
+            }
+        }
         for padding in [
             icon.y - r.y,
             name.x - r.x,
@@ -6350,5 +6509,37 @@ mod tests {
             .hits
             .iter()
             .any(|h| matches!(h.action, Action::DeviceMenu(_))));
+    }
+    #[test]
+    fn telemetry_changes_neither_the_bar_width_nor_control_positions() {
+        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 1000, 34).unwrap();
+        let cr = Context::new(&image).unwrap();
+        for font in ["Sans 11", "Pretendard JP Medium 11"] {
+            let mut m = Model::new();
+            m.font = font.into();
+            let mut reference = None;
+            for value in ["0", "9", "48", "100"] {
+                for key in ["temperature", "cpu", "memory", "disk"] {
+                    let suffix = if key == "temperature" { "°C" } else { "%" };
+                    m.metrics.values.insert(
+                        key,
+                        crate::bar_backend::Metric {
+                            text: format!("icon {value}{suffix}"),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let width = bar_width(&cr, &m, "right", "");
+                let scene = bar(&cr, &m, 1, "right", "", width);
+                let group = scene
+                    .hits
+                    .iter()
+                    .find(|h| matches!(h.action, Action::Page(Page::Home)))
+                    .unwrap()
+                    .rect;
+                let geometry = (width, group.x.to_bits(), group.w.to_bits());
+                assert_eq!(*reference.get_or_insert(geometry), geometry);
+            }
+        }
     }
 }

@@ -117,7 +117,7 @@ impl Paint<'_> {
     }
     fn display_canvas(&mut self, mut y: f64) -> f64 {
         let outputs = &self.m.display.outputs;
-        let h = if outputs.len() > 1 { 168.0 } else { 122.0 };
+        let h = if outputs.len() > 1 { 216.0 } else { 122.0 };
         crystal(self.cr, r(20.0, y, 432.0, h), 18.0, false);
         self.display_text(
             "디스플레이 배치",
@@ -133,58 +133,139 @@ impl Paint<'_> {
             false,
             "",
         );
-        // Keep projection stable during dragging: derive it from committed output bounds.
-        let minx = outputs.iter().map(|o| o.x).min().unwrap_or(0) as f64;
-        let miny = outputs.iter().map(|o| o.y).min().unwrap_or(0) as f64;
+        // Reserve both horizontal and vertical arrangements at one fixed scale.
+        // Dragging, edge previews and dropping must never resize monitor cards.
+        let position = |o: &display::Output| {
+            self.m
+                .display_layout
+                .iter()
+                .find(|p| p.identity == o.identity)
+                .map_or((o.x, o.y), |p| (p.x, p.y))
+        };
+        let minx = outputs.iter().map(|o| position(o).0).min().unwrap_or(0) as f64;
+        let miny = outputs.iter().map(|o| position(o).1).min().unwrap_or(0) as f64;
         let maxx = outputs
             .iter()
-            .map(|o| i64::from(o.x) + i64::from(o.logical_width))
+            .map(|o| i64::from(position(o).0) + i64::from(o.logical_width))
             .max()
             .unwrap_or(1) as f64;
         let maxy = outputs
             .iter()
-            .map(|o| i64::from(o.y) + i64::from(o.logical_height))
+            .map(|o| i64::from(position(o).1) + i64::from(o.logical_height))
             .max()
             .unwrap_or(1) as f64;
-        let factor =
-            (340.0 / (maxx - minx).max(1.0)).min((h - 58.0) / (maxy - miny).max(1.0)) * 0.85;
+        let total_width = outputs
+            .iter()
+            .map(|o| f64::from(o.logical_width))
+            .sum::<f64>();
+        let total_height = outputs
+            .iter()
+            .map(|o| f64::from(o.logical_height))
+            .sum::<f64>();
+        let factor = (340.0 / total_width.max(1.0)).min((h - 58.0) / total_height.max(1.0)) * 0.85;
         let cx = 236.0 - (maxx + minx) * 0.5 * factor;
         let cy = y + 42.0 + (h - 50.0) * 0.5 - (maxy + miny) * 0.5 * factor;
         let _ = self.cr.save();
         round(self.cr, r(28.0, y + 40.0, 416.0, h - 44.0), 12.0);
         self.cr.clip();
-        for (i, o) in outputs.iter().enumerate() {
-            let (x, oy) = self
-                .m
-                .display_layout
-                .iter()
-                .find(|p| p.identity == o.identity)
-                .map_or((o.x, o.y), |p| (p.x, p.y));
-            let rect = r(
-                cx + f64::from(x) * factor,
-                cy + f64::from(oy) * factor,
-                f64::from(o.logical_width) * factor,
-                f64::from(o.logical_height) * factor,
+        let preview = self.m.display_snap_preview();
+        let projected = |o: &display::Output| {
+            preview
+                .and_then(|draft| draft.iter().find(|p| p.identity == o.identity))
+                .map_or_else(|| position(o), |p| (p.x, p.y))
+        };
+        let px0 = outputs.iter().map(|o| projected(o).0).min().unwrap_or(0) as f64;
+        let py0 = outputs.iter().map(|o| projected(o).1).min().unwrap_or(0) as f64;
+        let px1 = outputs
+            .iter()
+            .map(|o| f64::from(projected(o).0) + f64::from(o.logical_width))
+            .fold(px0, f64::max);
+        let py1 = outputs
+            .iter()
+            .map(|o| f64::from(projected(o).1) + f64::from(o.logical_height))
+            .fold(py0, f64::max);
+        let preview_cx = 236.0 - (px0 + px1) * 0.5 * factor;
+        let preview_cy = y + 42.0 + (h - 50.0) * 0.5 - (py0 + py1) * 0.5 * factor;
+        let duration = std::time::Duration::from_millis(180);
+        for o in outputs {
+            let target = self.m.display_drop_target(&o.name);
+            let amount = self.m.motion_value(
+                &format!("display-snap-{}", o.name),
+                if target { 1.0 } else { 0.0 },
+                duration,
             );
-            crystal(self.cr, rect, 8.0, self.display_hover(rect));
-            text(
-                self.cr,
-                &self.m.font,
-                &(i + 1).to_string(),
-                rect,
-                false,
-                true,
-                22.0,
-                pango::Alignment::Center,
-            );
-            if outputs.len() > 1 && self.m.display.pending.is_none() {
-                self.hit(
+            if amount > 0.001 {
+                let (x, oy) = projected(o);
+                let inset = (1.0 - amount) * 6.0;
+                let ghost = r(
+                    preview_cx + f64::from(x) * factor + inset,
+                    preview_cy + f64::from(oy) * factor + inset,
+                    f64::from(o.logical_width) * factor - inset * 2.0,
+                    f64::from(o.logical_height) * factor - inset * 2.0,
+                );
+                round(self.cr, ghost, 8.0);
+                color(self.cr, ACCENT, 0.16 * amount);
+                let _ = self.cr.fill_preserve();
+                color(self.cr, ACCENT, 0.85 * amount);
+                self.cr.set_line_width(1.5);
+                let _ = self.cr.stroke();
+            }
+        }
+        // The grabbed card follows the pointer above the independent snap ghost.
+        for floating_pass in [false, true] {
+            for (i, o) in outputs.iter().enumerate() {
+                let floating = self
+                    .m
+                    .display_floating()
+                    .filter(|(name, _, _)| *name == o.name);
+                if floating.is_some() != floating_pass {
+                    continue;
+                }
+                let (dx, dy) = projected(o);
+                let screen_x = self.m.motion_value(
+                    &format!("display-card-{}-x", o.name),
+                    preview_cx + f64::from(dx) * factor,
+                    duration,
+                );
+                let screen_y = self.m.motion_value(
+                    &format!("display-card-{}-y", o.name),
+                    preview_cy - y + f64::from(dy) * factor,
+                    duration,
+                ) + y;
+                let (screen_x, screen_y) = floating.map_or((screen_x, screen_y), |(_, x, oy)| {
+                    (cx + f64::from(x) * factor, cy + f64::from(oy) * factor)
+                });
+                let rect = r(
+                    screen_x,
+                    screen_y,
+                    f64::from(o.logical_width) * factor,
+                    f64::from(o.logical_height) * factor,
+                );
+                crystal(
+                    self.cr,
                     rect,
-                    Action::DisplayDrag(o.name.clone(), factor),
-                    "드래그하여 화면 배치",
-                )
-            } else {
-                self.hit(rect, Action::DisplayMonitor, "");
+                    8.0,
+                    floating.is_some() || self.display_hover(rect),
+                );
+                text(
+                    self.cr,
+                    &self.m.font,
+                    &(i + 1).to_string(),
+                    rect,
+                    false,
+                    true,
+                    22.0,
+                    pango::Alignment::Center,
+                );
+                if outputs.len() > 1 && self.m.display.pending.is_none() {
+                    self.hit(
+                        rect,
+                        Action::DisplayDrag(o.name.clone(), factor),
+                        "드래그하여 화면 배치",
+                    )
+                } else {
+                    self.hit(rect, Action::DisplayMonitor, "");
+                }
             }
         }
         let _ = self.cr.restore();
@@ -322,17 +403,6 @@ impl Paint<'_> {
             o.control.is_some(),
         );
         y += 36.0;
-        if o.control.is_none() {
-            y += 6.0;
-            self.display_text(
-                &o.brightness_error,
-                r(34.0, y, 394.0, 32.0),
-                10.0,
-                false,
-                true,
-            );
-            y += 32.0;
-        }
         y + 18.0 + 12.0
     }
     fn display_choices(&mut self, mut y: f64, choices: &[(String, Action, bool)]) -> f64 {
@@ -577,6 +647,122 @@ pub fn identify(cr: &Context, m: &Model, index: usize) -> Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scrolling_moves_monitor_cards_with_canvas_without_starting_layout_motion() {
+        let mut m = model();
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 500).unwrap();
+        let cr = Context::new(&surface).unwrap();
+        let scene = super::super::popup(&cr, &m, 1, 500);
+        let initial = scene
+            .hits
+            .iter()
+            .find(|h| matches!(h.action, Action::DisplayMonitor))
+            .unwrap()
+            .rect;
+        for scroll in [20.0, 35.0, 0.0] {
+            m.scroll = scroll;
+            let scene = super::super::popup(&cr, &m, 1, 500);
+            let card = scene
+                .hits
+                .iter()
+                .find(|h| matches!(h.action, Action::DisplayMonitor))
+                .unwrap()
+                .rect;
+            assert!((card.y - initial.y + scroll).abs() < 0.000001);
+            assert!(
+                !m.animating(),
+                "scroll must not animate card positions separately"
+            );
+        }
+    }
+    #[test]
+    fn edge_preview_is_separate_from_draft_and_cards_never_resize() {
+        let mut m = model();
+        let mut external = m.display.outputs[0].clone();
+        external.name = "DP-3".into();
+        external.identity = "external-test".into();
+        external.x = 1706;
+        external.logical_width = 1920;
+        external.logical_height = 1080;
+        m.display.outputs.push(external);
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 500).unwrap();
+        let cr = Context::new(&surface).unwrap();
+        let scene = super::super::popup(&cr, &m, 1, 500);
+        let hit = scene
+            .hits
+            .iter()
+            .find(|h| matches!(&h.action, Action::DisplayDrag(name, _) if name == "DP-3"))
+            .unwrap();
+        let Action::DisplayDrag(_, factor) = hit.action else {
+            unreachable!()
+        };
+        let size = (hit.rect.w, hit.rect.h);
+        m.begin_display_drag("DP-3".into(), factor, 0.0, 0.0);
+        m.drag_display((-960.0 - 1706.0) * factor, 0.0);
+        assert!(m.display_snap_preview().is_some());
+        assert_eq!(
+            m.display_layout
+                .iter()
+                .find(|p| p.name == "eDP-1")
+                .unwrap()
+                .x,
+            0
+        );
+        let scene = super::super::popup(&cr, &m, 1, 500);
+        let hit = scene
+            .hits
+            .iter()
+            .find(|h| matches!(&h.action, Action::DisplayDrag(name, _) if name == "DP-3"))
+            .unwrap();
+        assert!((hit.rect.w - size.0).abs() < 0.000001);
+        assert!((hit.rect.h - size.1).abs() < 0.000001);
+        m.end_display_drag();
+        assert_eq!(
+            m.display_layout
+                .iter()
+                .find(|p| p.name == "eDP-1")
+                .unwrap()
+                .x,
+            1920
+        );
+        assert_eq!(
+            m.display_layout
+                .iter()
+                .find(|p| p.name == "DP-3")
+                .unwrap()
+                .x,
+            0
+        );
+        // Reorienting the layout also keeps the exact same drawing scale.
+        m.display_layout[0].x = 0;
+        m.display_layout[0].y = 1080;
+        m.display_layout[1].x = 0;
+        m.display_layout[1].y = 0;
+        let scene = super::super::popup(&cr, &m, 1, 500);
+        let hit = scene
+            .hits
+            .iter()
+            .find(|h| matches!(&h.action, Action::DisplayDrag(name, _) if name == "DP-3"))
+            .unwrap();
+        assert!((hit.rect.w - size.0).abs() < 0.000001);
+        assert!((hit.rect.h - size.1).abs() < 0.000001);
+    }
+    #[test]
+    fn dragging_into_monitor_center_has_no_snap_preview_and_does_not_commit() {
+        let mut m = model();
+        let mut external = m.display.outputs[0].clone();
+        external.name = "DP-3".into();
+        external.identity = "external-test".into();
+        external.x = 1706;
+        external.logical_width = 1920;
+        external.logical_height = 1080;
+        m.display.outputs.push(external);
+        m.begin_display_drag("DP-3".into(), 0.07, 0.0, 0.0);
+        m.drag_display((-107.0 - 1706.0) * 0.07, 0.0);
+        assert!(m.display_snap_preview().is_none());
+        m.end_display_drag();
+        assert!(!m.display_layout_changed());
+    }
     #[test]
     fn dropdown_value_is_centered_without_counting_the_arrow() {
         let m = model();

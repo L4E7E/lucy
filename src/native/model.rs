@@ -24,6 +24,7 @@ pub enum Page {
     Bluetooth,
     Power,
     Display,
+    System,
     Session,
     TrayMenu,
     Calendar,
@@ -37,6 +38,7 @@ impl Page {
             "bluetooth" => Self::Bluetooth,
             "power" => Self::Power,
             "display" => Self::Display,
+            "system" | "monitor" => Self::System,
             "session" => Self::Session,
             "tray" => Self::TrayMenu,
             "calendar" => Self::Calendar,
@@ -57,6 +59,7 @@ pub enum Slider {
 #[derive(Clone, Debug)]
 pub enum Action {
     Page(Page),
+    MonitorThread(u32),
     Wifi,
     Bluetooth,
     Bt(bt::Request),
@@ -256,6 +259,31 @@ impl PinInput {
         }
     }
 }
+pub const SESSION_ACTIONS: [(&str, &str, &str); 5] = [
+    ("잠금", "lock", "lock"),
+    ("절전", "suspend", "sleep"),
+    ("로그아웃", "logout", "logout"),
+    ("다시 시작", "reboot", "restart"),
+    ("전원 끄기", "poweroff", "power"),
+];
+pub fn session_shortcut(sym: u32) -> Option<&'static str> {
+    let index = match sym {
+        0x31..=0x35 => sym - 0x31,
+        0xffb1..=0xffb5 => sym - 0xffb1,
+        _ => return None,
+    };
+    Some(SESSION_ACTIONS[index as usize].1)
+}
+#[derive(Clone)]
+struct DisplayDrag {
+    name: String,
+    factor: f64,
+    pointer: (f64, f64),
+    origin: (i32, i32),
+    baseline: Vec<display::Placement>,
+    floating: (i32, i32),
+    preview: Option<Vec<display::Placement>>,
+}
 pub struct Model {
     pub display: display::State,
     pub display_tx: Option<mpsc::Sender<display::Request>>,
@@ -265,7 +293,7 @@ pub struct Model {
     display_clock_wheel: Option<ClockWheel>,
     display_time_draft: Option<(u32, u32, Instant)>,
     pub display_layout: Vec<display::Placement>,
-    display_drag: Option<(String, f64, f64, f64, i32, i32)>,
+    display_drag: Option<DisplayDrag>,
     pub gamma_supported: bool,
     pub gamma_active: bool,
     pub gamma_error: String,
@@ -301,6 +329,8 @@ pub struct Model {
     pub audio: Value,
     pub network: Option<net::State>,
     pub metrics: bar::State,
+    pub monitor: super::monitor::State,
+    pub monitor_tx: Option<mpsc::Sender<super::monitor::Request>>,
     pub workspaces: Vec<Value>,
     workspace_wheel: Option<WorkspaceWheel>,
     pub bar_outputs: Value,
@@ -395,6 +425,18 @@ impl Model {
     pub fn display_dragging(&self) -> bool {
         self.display_drag.is_some()
     }
+    pub fn display_drop_target(&self, name: &str) -> bool {
+        self.display_drag
+            .as_ref()
+            .is_some_and(|d| d.name == name && d.preview.is_some())
+    }
+    pub fn display_snap_preview(&self) -> Option<&[display::Placement]> {
+        self.display_drag.as_ref()?.preview.as_deref()
+    }
+    pub fn display_floating(&self) -> Option<(&str, i32, i32)> {
+        let drag = self.display_drag.as_ref()?;
+        Some((&drag.name, drag.floating.0, drag.floating.1))
+    }
     pub fn begin_display_drag(&mut self, name: String, factor: f64, x: f64, y: f64) {
         if self.display.outputs.len() < 2
             || self.display.pending.is_some()
@@ -412,95 +454,82 @@ impl Model {
                 .collect();
         }
         if let Some(p) = self.display_layout.iter().find(|p| p.name == name) {
-            self.display_drag = Some((name, factor, x, y, p.x, p.y));
+            self.display_drag = Some(DisplayDrag {
+                name,
+                factor,
+                pointer: (x, y),
+                origin: (p.x, p.y),
+                baseline: self.display_layout.clone(),
+                floating: (p.x, p.y),
+                preview: None,
+            });
         }
     }
     pub fn drag_display(&mut self, x: f64, y: f64) {
-        let Some((name, factor, sx, sy, ox, oy)) = self.display_drag.clone() else {
+        let Some(drag) = self.display_drag.as_mut() else {
             return;
         };
-        let Some(output) = self.display.outputs.iter().find(|o| o.name == name) else {
+        let x = drag.origin.0 + ((x - drag.pointer.0) / drag.factor).round() as i32;
+        let y = drag.origin.1 + ((y - drag.pointer.1) / drag.factor).round() as i32;
+        drag.floating = (x.clamp(-16000, 16000), y.clamp(-16000, 16000));
+        let Some(output) = self.display.outputs.iter().find(|o| o.name == drag.name) else {
             return;
         };
-        let (mut nx, mut ny) = (
-            ox + ((x - sx) / factor).round() as i32,
-            oy + ((y - sy) / factor).round() as i32,
+        let center = (
+            f64::from(x) + f64::from(output.logical_width) * 0.5,
+            f64::from(y) + f64::from(output.logical_height) * 0.5,
         );
-        for other in self.display_layout.iter().filter(|p| p.name != name) {
-            let Some(o) = self.display.outputs.iter().find(|o| o.name == other.name) else {
-                continue;
-            };
-            for edge in [
-                other.x,
-                other.x + o.logical_width as i32,
-                other.x - output.logical_width as i32,
-            ] {
-                if f64::from(nx - edge).abs() * factor < 9.0 {
-                    nx = edge;
-                }
-            }
-            for edge in [
-                other.y,
-                other.y + o.logical_height as i32,
-                other.y - output.logical_height as i32,
-            ] {
-                if f64::from(ny - edge).abs() * factor < 9.0 {
-                    ny = edge;
-                }
-            }
-        }
-        if let Some(p) = self.display_layout.iter_mut().find(|p| p.name == name) {
-            p.x = nx.clamp(-16000, 16000);
-            p.y = ny.clamp(-16000, 16000);
-        }
+        let margin = if drag.preview.is_some() { 28.0 } else { 20.0 } / drag.factor;
+        let near_edge = drag
+            .baseline
+            .iter()
+            .filter(|p| p.name != drag.name)
+            .any(|p| {
+                let Some(o) = self
+                    .display
+                    .outputs
+                    .iter()
+                    .find(|o| o.identity == p.identity)
+                else {
+                    return false;
+                };
+                let (left, top) = (f64::from(p.x), f64::from(p.y));
+                let (right, bottom) = (
+                    left + f64::from(o.logical_width),
+                    top + f64::from(o.logical_height),
+                );
+                ((center.0 - left).abs().min((center.0 - right).abs()) <= margin
+                    && center.1 >= top - margin
+                    && center.1 <= bottom + margin)
+                    || ((center.1 - top).abs().min((center.1 - bottom).abs()) <= margin
+                        && center.0 >= left - margin
+                        && center.0 <= right + margin)
+            });
+        drag.preview = if near_edge {
+            display::snap_layout(
+                &self.display.outputs,
+                &drag.baseline,
+                &drag.name,
+                x.clamp(-16000, 16000),
+                y.clamp(-16000, 16000),
+            )
+            .filter(|draft| {
+                draft.iter().any(|p| {
+                    drag.baseline
+                        .iter()
+                        .find(|old| old.identity == p.identity)
+                        .is_some_and(|old| old.x != p.x || old.y != p.y)
+                })
+            })
+        } else {
+            None
+        };
     }
     pub fn end_display_drag(&mut self) {
-        let Some((name, _, _, _, _, _)) = self.display_drag.take() else {
-            return;
-        };
-        if display::validate_placements(&self.display.outputs, &self.display_layout).is_err() {
-            let original = self.display_layout.clone();
-            let Some(p) = original.iter().find(|p| p.name == name) else {
-                return;
-            };
-            let Some(o) = self.display.outputs.iter().find(|o| o.name == name) else {
-                return;
-            };
-            let mut candidates = vec![];
-            for other in original.iter().filter(|p| p.name != name) {
-                if let Some(d) = self.display.outputs.iter().find(|d| d.name == other.name) {
-                    for (x, y) in [
-                        (other.x + d.logical_width as i32, other.y),
-                        (other.x - o.logical_width as i32, other.y),
-                        (other.x, other.y + d.logical_height as i32),
-                        (other.x, other.y - o.logical_height as i32),
-                    ] {
-                        candidates.push((
-                            i64::from(x - p.x).pow(2) + i64::from(y - p.y).pow(2),
-                            x,
-                            y,
-                        ));
-                    }
-                }
+        if let Some(drag) = self.display_drag.take() {
+            if let Some(preview) = drag.preview {
+                self.display_layout = preview;
             }
-            candidates.sort_unstable();
-            for (_, x, y) in candidates {
-                let mut next = original.clone();
-                if let Some(p) = next.iter_mut().find(|p| p.name == name) {
-                    p.x = x;
-                    p.y = y;
-                }
-                if display::validate_placements(&self.display.outputs, &next).is_ok() {
-                    self.display_layout = next;
-                    break;
-                }
-            }
-        }
-        let mx = self.display_layout.iter().map(|p| p.x).min().unwrap_or(0);
-        let my = self.display_layout.iter().map(|p| p.y).min().unwrap_or(0);
-        for p in &mut self.display_layout {
-            p.x -= mx;
-            p.y -= my;
         }
     }
     pub fn display_send(&mut self, request: display::Request) {
@@ -748,6 +777,8 @@ impl Model {
             audio: Value::Null,
             network: None,
             metrics: bar::State::default(),
+            monitor: super::monitor::State::default(),
+            monitor_tx: None,
             workspaces: vec![],
             workspace_wheel: None,
             bar_outputs: Value::Null,
@@ -808,6 +839,9 @@ impl Model {
         }
     }
     pub fn navigate(&mut self, page: Page) {
+        if let Some(tx) = &self.monitor_tx {
+            let _ = tx.send(super::monitor::Request::Visible(page == Page::System));
+        }
         if page != Page::Display {
             self.display_menu = None;
         }
@@ -959,6 +993,9 @@ impl Model {
         }
     }
     pub fn hide(&mut self) {
+        if let Some(tx) = &self.monitor_tx {
+            let _ = tx.send(super::monitor::Request::Visible(false));
+        }
         self.display_drag = None;
         self.display_menu = None;
         self.wifi_scan_pending = false;
@@ -1449,7 +1486,7 @@ impl Model {
                     self.expanded_notifications.insert(key);
                 }
             }
-            Action::NoticeHover => {}
+            Action::NoticeHover | Action::MonitorThread(_) => {}
             Action::Scrollbar(_) => {}
             Action::DeleteNotices(ids) => {
                 self.prepare_notice_exit(&ids);
@@ -1975,6 +2012,38 @@ impl Model {
         }
     }
 }
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    #[test]
+    fn detailed_sampling_is_enabled_only_for_the_monitor_and_stops_on_hide() {
+        let (tx, rx) = mpsc::channel();
+        let mut m = Model::new();
+        m.monitor_tx = Some(tx);
+        m.navigate(Page::System);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            super::super::monitor::Request::Visible(true)
+        ));
+        m.hide();
+        assert!(matches!(
+            rx.recv().unwrap(),
+            super::super::monitor::Request::Visible(false)
+        ));
+        m.navigate(Page::System);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            super::super::monitor::Request::Visible(true)
+        ));
+        m.navigate(Page::Home);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            super::super::monitor::Request::Visible(false)
+        ));
+        assert_eq!(Page::parse("monitor"), Page::System);
+    }
+}
 impl Drop for Model {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
@@ -1999,6 +2068,17 @@ pub fn collection(kind: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_numbers_and_keypad_match_visible_button_order() {
+        use super::*;
+        for (index, (_, command, _)) in SESSION_ACTIONS.iter().enumerate() {
+            assert_eq!(session_shortcut(0x31 + index as u32), Some(*command));
+            assert_eq!(session_shortcut(0xffb1 + index as u32), Some(*command));
+        }
+        for sym in [0x30, 0x36, 0xff1b, 0xff0d] {
+            assert_eq!(session_shortcut(sym), None);
+        }
+    }
     #[test]
     fn delayed_media_reports_cannot_undo_drag_or_acknowledge_the_wrong_position() {
         use super::*;

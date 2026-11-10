@@ -59,6 +59,20 @@ thread_local! {
     static PRIVATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SMOOTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static COVERAGE: RefCell<Vec<(pango::Layout, u64, Coverage)>> = const { RefCell::new(Vec::new()) };
+    static CONTEXTS: RefCell<Vec<(ContextKey, pango::Context)>> = const { RefCell::new(Vec::new()) };
+}
+#[derive(PartialEq)]
+struct ContextKey {
+    matrix: [u64; 4],
+    device_scale: [u64; 2],
+    options: cairo::FontOptions,
+}
+#[link(name = "cairo")]
+extern "C" {
+    fn cairo_surface_get_font_options(
+        surface: *mut cairo::ffi::cairo_surface_t,
+        options: *mut cairo::ffi::cairo_font_options_t,
+    );
 }
 pub struct Private(bool);
 impl Private {
@@ -100,13 +114,51 @@ pub fn layout(key: Key, build: impl FnOnce() -> pango::Layout) -> pango::Layout 
 }
 #[link(name = "pangocairo-1.0")]
 extern "C" {
+    fn pango_cairo_create_context(cr: *mut cairo::ffi::cairo_t) -> *mut pango::ffi::PangoContext;
+    #[cfg(test)]
     fn pango_cairo_create_layout(cr: *mut cairo::ffi::cairo_t) -> *mut pango::ffi::PangoLayout;
     fn pango_cairo_show_layout(cr: *mut cairo::ffi::cairo_t, layout: *mut pango::ffi::PangoLayout);
     fn pango_cairo_layout_path(cr: *mut cairo::ffi::cairo_t, layout: *mut pango::ffi::PangoLayout);
 }
 pub fn create(cr: &Context) -> pango::Layout {
-    // SAFETY: Cairo is live; Pango returns a new, owned GObject reference.
-    unsafe { from_glib_full(pango_cairo_create_layout(cr.to_raw_none())) }
+    // Layouts stay independent, but share their font/shaping context for the
+    // same transform/options. Never mutate a cached context: older cached
+    // layouts may still refer to it, including layouts on the other output.
+    let Ok(mut options) = cairo::FontOptions::new() else {
+        let context = unsafe { from_glib_full(pango_cairo_create_context(cr.to_raw_none())) };
+        return pango::Layout::new(&context);
+    };
+    let target = cr.target();
+    unsafe {
+        cairo_surface_get_font_options(target.to_raw_none(), options.to_raw_none());
+    }
+    if let Ok(explicit) = cr.font_options() {
+        options.merge(&explicit);
+    }
+    let matrix = cr.matrix();
+    let (dx, dy) = target.device_scale();
+    let key = ContextKey {
+        matrix: [matrix.xx(), matrix.yx(), matrix.xy(), matrix.yy()].map(f64::to_bits),
+        device_scale: [dx.to_bits(), dy.to_bits()],
+        options,
+    };
+    CONTEXTS.with(|contexts| {
+        let mut contexts = contexts.borrow_mut();
+        if let Some(index) = contexts.iter().position(|(k, _)| *k == key) {
+            let entry = contexts.remove(index);
+            let layout = pango::Layout::new(&entry.1);
+            contexts.push(entry);
+            return layout;
+        }
+        // SAFETY: Cairo is live; Pango returns a new, owned GObject reference.
+        let context = unsafe { from_glib_full(pango_cairo_create_context(cr.to_raw_none())) };
+        let layout = pango::Layout::new(&context);
+        if contexts.len() >= 8 {
+            contexts.remove(0);
+        }
+        contexts.push((key, context));
+        layout
+    })
 }
 
 /// Glass text uses grayscale coverage, not LCD subpixels or grid-fitted stems.
@@ -357,6 +409,49 @@ pub fn caption(cr: &Context, font: &str, value: &str, size: f64) -> Option<Capti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contexts_are_shared_bounded_and_preserve_original_text_pixels() {
+        CONTEXTS.with(|c| c.borrow_mut().clear());
+        for scale in [1.0, 1.5, 2.0] {
+            for smooth in [false, true] {
+                let mut actual = ImageSurface::create(Format::ARgb32, 900, 180).unwrap();
+                let mut expected = ImageSurface::create(Format::ARgb32, 900, 180).unwrap();
+                for (image, cached) in [(&actual, true), (&expected, false)] {
+                    let cr = Context::new(image).unwrap();
+                    cr.scale(scale, scale);
+                    cr.translate(1.25, 2.75);
+                    let _smooth = smooth.then(|| SmoothText::enter(&cr));
+                    let layout = if cached {
+                        create(&cr)
+                    } else {
+                        unsafe { from_glib_full(pango_cairo_create_layout(cr.to_raw_none())) }
+                    };
+                    let mut desc = pango::FontDescription::from_string("Sans 13");
+                    desc.set_absolute_size(17.0 * f64::from(pango::SCALE));
+                    layout.set_font_description(Some(&desc));
+                    layout.set_text("알림 Notification 0123 · العربية");
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.move_to(10.0, 12.0);
+                    unsafe { pango_cairo_show_layout(cr.to_raw_none(), layout.to_glib_none().0) };
+                    if cached {
+                        let another = create(&cr);
+                        assert_ne!(layout, another);
+                        assert_eq!(layout.context(), another.context());
+                    }
+                }
+                assert_eq!(&*actual.data().unwrap(), &*expected.data().unwrap());
+            }
+        }
+        assert_eq!(CONTEXTS.with(|c| c.borrow().len()), 6);
+        let image = ImageSurface::create(Format::A8, 1, 1).unwrap();
+        let cr = Context::new(&image).unwrap();
+        for i in 1..=20 {
+            cr.identity_matrix();
+            cr.scale(1.0 + f64::from(i) / 10.0, 1.0);
+            create(&cr);
+        }
+        assert_eq!(CONTEXTS.with(|c| c.borrow().len()), 8);
+    }
     fn sample_layout(cr: &Context, value: &str) -> pango::Layout {
         let layout = create(cr);
         let mut desc = pango::FontDescription::from_string("Pretendard JP Medium 11");

@@ -318,9 +318,9 @@ impl Client {
                     g.verify_text_copy(&bytes, w.size);
                     self.pixel_checks += 1;
                 }
-                let shine = !self.busy && self.secret.len() == 0;
+                let shine = self.busy || self.secret.len() == 0;
                 let mut mask = shine
-                    .then(|| lock_draw::prompt_mask(&self.font, scale))
+                    .then(|| lock_draw::prompt_mask(&self.font, scale, self.busy))
                     .flatten();
                 if let Some((mask, bounds)) = mask.as_mut() {
                     let (mw, mh) = (mask.width(), mask.height());
@@ -402,7 +402,7 @@ impl Client {
         Ok(())
     }
     fn animate(&mut self, qh: &QueueHandle<Self>) {
-        let shine = !self.busy && self.secret.len() == 0;
+        let shine = self.busy || self.secret.len() == 0;
         for (id, w) in &mut self.windows {
             if !std::mem::take(&mut w.frame_ready) || !w.ready {
                 continue;
@@ -1142,7 +1142,12 @@ fn client(
             let frames: u64 = s.windows.values().map(|w| w.presented).sum();
             let rasters: u64 = s.windows.values().map(|w| w.rasterized).sum();
             let outputs = s.windows.len() as u64;
-            if stage == 0 && frames >= 200 {
+            if stage == 0
+                && frames >= 200
+                && s.windows
+                    .values()
+                    .all(|w| w.gpu.as_ref().is_some_and(|g| !g.lock_animating()))
+            {
                 assert!(
                     rasters <= outputs * 4,
                     "GPU animation must not rerasterize the lock screen"
@@ -1161,7 +1166,7 @@ fn client(
             } else if stage == 1 && Instant::now() >= hold_until {
                 assert!(
                     frames <= held_frames + outputs,
-                    "typing must stop shimmer frame callbacks"
+                    "typing must stop shimmer frame callbacks: before={held_frames}, after={frames}, outputs={outputs}, busy={}, secret_len={}", s.busy, s.secret.len()
                 );
                 assert_eq!(rasters, held_rasters + outputs);
                 println!("prompt: animation stopped while password dots are visible");
@@ -1172,6 +1177,22 @@ fn client(
             } else if stage == 2 && frames >= held_frames + 120 {
                 println!("prompt: animation resumed after clearing the preview input");
                 stage = 3;
+                s.busy = true;
+                s.dirty = true;
+                held_frames = frames;
+                held_rasters = rasters;
+            } else if stage == 3 && frames >= held_frames + 120 {
+                assert!(s
+                    .windows
+                    .values()
+                    .all(|w| w.gpu.as_ref().is_some_and(|g| g.shimmer_active())));
+                assert_eq!(
+                    rasters,
+                    held_rasters + outputs,
+                    "busy shimmer must stay GPU-only"
+                );
+                println!("prompt: checking text keeps the same GPU shimmer without rerasterizing");
+                stage = 4;
                 s.quit = true;
             }
         }
@@ -1213,7 +1234,7 @@ fn client(
     }
     #[cfg(test)]
     if probe == Probe::Prompt {
-        assert_eq!(stage, 3);
+        assert_eq!(stage, 4);
         assert!(s.lock.is_none(), "prompt test must never lock the desktop");
         assert_eq!(s.phase, Phase::Waiting);
     }

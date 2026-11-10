@@ -26,6 +26,9 @@ gestures {
 // directly; no XF86 binding is needed and brightness must not be adjusted twice.
 // Control and calendar borrow their original right/center bar wl_surface.
 // Keep Lucy corners at 20: GPU material and Niri blur masks resize together.
+// Non-xray blur includes the windows underneath rather than only the wallpaper.
+// Niri 26.04 has a cross-GPU non-xray blur bug; use a build containing the
+// upstream Smithay fix. See https://github.com/niri-wm/niri/pull/4395.
 // The modal session scrim covers all outputs with one shared pixel.
 layer-rule {
     match namespace="^lucy-session-backdrop$"
@@ -51,7 +54,7 @@ layer-rule {
     shadow { off; }
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }
 layer-rule {
@@ -60,7 +63,7 @@ layer-rule {
     shadow { off; }
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }
 layer-rule {

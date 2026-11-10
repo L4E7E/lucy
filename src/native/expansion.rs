@@ -5,17 +5,37 @@ use std::{
 };
 
 pub const CLOCK_SCALE: f32 = 3.0;
-pub const CALENDAR_CLOCK_SIZE: f64 = 46.0;
-// The enlarged header's centered glyphs share the notification title's ink top.
-pub const CALENDAR_CLOCK_Y: f32 = -8.0;
+pub const CALENDAR_CLOCK_SIZE: f64 = 58.0;
+// Give the enlarged clock a little top breathing room without moving the calendar.
+pub const CALENDAR_CLOCK_Y: f32 = 0.0;
 pub const PANEL_OPEN_MS: u64 = 360;
 pub const NOTICE_OPEN_MS: u64 = 480;
+pub const OSD_OPEN_MS: u64 = 450;
+
+#[cfg(test)]
+mod osd_shape_tests {
+    #[test]
+    fn osd_expands_only_sideways() {
+        for step in 0..=100 {
+            let frame = super::layout(step as f32 / 100.0, 180.0, (260, 34), 180.0, false);
+            assert_eq!(frame.size.1, 34);
+            assert_eq!(frame.header_scale, 1.0);
+            assert_eq!(frame.header.1, 0.0);
+            assert!((180..=260).contains(&frame.size.0));
+        }
+    }
+}
 /// Normalized critically damped response: monotone, with no early clipped
 /// overshoot that makes a nominally long expansion snap open in its first 25%.
 pub fn relaxed(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     let decay = |v: f32| 1.0 - (-6.0 * v).exp() * (1.0 + 6.0 * v);
     (decay(t) / decay(1.0)).clamp(0.0, 1.0)
+}
+
+fn osd_open(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,7 +96,7 @@ impl Expansion {
             } else if target.1 > 34 {
                 NOTICE_OPEN_MS
             } else {
-                360
+                OSD_OPEN_MS
             }),
             last: Cell::new(0.0),
             origin: None,
@@ -86,13 +106,15 @@ impl Expansion {
         (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
     }
     pub fn frame(&self, header: f32) -> Frame {
-        let t = self.time();
+        self.frame_at(self.time(), header)
+    }
+    fn frame_at(&self, t: f32, header: f32) -> Frame {
         let ease = if self.closing() {
             t * t * (3.0 - 2.0 * t)
         } else if self.target.1 > 34 {
             relaxed(t)
         } else {
-            super::gpu::spring(t).clamp(0.0, 1.0)
+            osd_open(t)
         };
         let mut f = layout(
             self.from + (self.to - self.from) * ease,
@@ -118,7 +140,9 @@ impl Expansion {
         f
     }
     pub fn close(&mut self, header: f32) {
-        let f = self.frame(header);
+        // Reverse from a frame actually committed to Wayland, just like reopen.
+        // Sampling wall time here can jump ahead when a frame callback is late.
+        let f = self.frame_at(self.last.get(), header);
         self.origin = Some((f.size.0 as f32, f.size.1 as f32));
         self.from = f.amount;
         self.to = 0.0;
@@ -130,7 +154,9 @@ impl Expansion {
         self.to == 0.0
     }
     pub fn reopen(&mut self, header: f32) {
-        let f = self.frame(header);
+        // Reverse from the last visible geometry, not an unpresented point
+        // further along the closing timeline when a callback was delayed.
+        let f = self.frame_at(self.last.get(), header);
         self.origin = Some((f.size.0 as f32, f.size.1 as f32));
         self.from = f.amount;
         self.to = 1.0;
@@ -140,7 +166,7 @@ impl Expansion {
         } else if self.target.1 > 34 {
             360
         } else {
-            240
+            OSD_OPEN_MS
         });
         self.last.set(0.0);
     }
@@ -165,7 +191,7 @@ impl Expansion {
         } else if target.1 > 34 {
             360
         } else {
-            260
+            OSD_OPEN_MS
         });
         self.last.set(0.0);
     }
@@ -180,10 +206,54 @@ impl Expansion {
 mod tests {
     use super::*;
     #[test]
+    fn closing_during_open_starts_at_the_last_presented_frame() {
+        let mut e = Expansion::new(180, (780, 500), true, true);
+        e.presented(0.3);
+        let visible = e.frame_at(0.3, 90.0);
+        e.start = Instant::now() - Duration::from_millis(350);
+        e.close(90.0);
+        let closed = e.frame_at(0.0, 90.0);
+        assert_eq!(closed.size, visible.size);
+        assert_eq!(closed.header, visible.header);
+        assert_eq!(closed.header_scale, visible.header_scale);
+    }
+    #[test]
+    fn interrupted_close_reopens_from_the_last_presented_size() {
+        let mut e = Expansion::new(180, (260, 34), false, false);
+        e.start = Instant::now() - Duration::from_secs(1);
+        e.presented(1.0);
+        e.close(180.0);
+        e.presented(0.25);
+        let visible = e.frame_at(0.25, 180.0);
+        e.start = Instant::now() - Duration::from_millis(180);
+        e.reopen(180.0);
+        assert_eq!(e.frame_at(0.0, 180.0).size, visible.size);
+    }
+    #[test]
+    fn osd_open_uses_the_whole_duration_instead_of_snapping_early() {
+        assert_eq!(osd_open(0.0), 0.0);
+        assert_eq!(osd_open(1.0), 1.0);
+        assert!(osd_open(0.25) < 0.20);
+        assert_eq!(osd_open(0.5), 0.5);
+        assert!(osd_open(0.75) < 0.90);
+        let mut e = Expansion::new(180, (260, 34), false, false);
+        for (ms, low, high) in [(112, 190, 197), (225, 216, 224), (337, 243, 252)] {
+            e.start = Instant::now() - Duration::from_millis(ms);
+            let f = e.frame(180.0);
+            assert!(
+                (low..=high).contains(&f.size.0),
+                "time={ms} size={:?}",
+                f.size
+            );
+            assert_eq!(f.size.1, 34);
+        }
+    }
+    #[test]
     fn closing_returns_to_the_live_tray_width_without_a_last_frame_jump() {
         for (old, current) in [(480, 680), (680, 480)] {
             let mut e = Expansion::new(old, (current, 500), false, true);
             e.start = Instant::now() - Duration::from_secs(1);
+            e.presented(1.0);
             e.close(current as f32);
             e.source = current as f32; // Current collapsed bar, not opening snapshot.
             for t in [0, 40, 120, 200, 240, 300] {
@@ -206,7 +276,7 @@ mod tests {
         }
     }
     #[test]
-    fn panels_and_notifications_open_gradually_without_slowing_the_osd() {
+    fn panels_and_notifications_keep_their_timing_while_osd_opens_more_gently() {
         assert_eq!(relaxed(0.0), 0.0);
         assert_eq!(relaxed(1.0), 1.0);
         assert!(relaxed(0.25) > 0.4 && relaxed(0.25) < 0.5);
@@ -225,8 +295,13 @@ mod tests {
         );
         assert_eq!(
             Expansion::new(170, (224, 34), false, false).duration,
-            Duration::from_millis(360)
+            Duration::from_millis(OSD_OPEN_MS)
         );
+        let mut osd = Expansion::new(170, (224, 34), false, false);
+        osd.close(170.0);
+        assert_eq!(osd.duration, Duration::from_millis(240));
+        osd.reopen(170.0);
+        assert_eq!(osd.duration, Duration::from_millis(OSD_OPEN_MS));
     }
     #[test]
     fn osd_only_changes_width_and_retarget_keeps_the_current_shape() {
@@ -244,6 +319,7 @@ mod tests {
         assert_eq!(e.frame(250.0).size, (360, 34));
         e.start = Instant::now() - Duration::from_secs(1);
         assert_eq!(e.frame(250.0).size, (380, 140));
+        e.presented(1.0);
         e.close(250.0);
         assert_eq!(e.frame(250.0).size, (380, 140));
     }

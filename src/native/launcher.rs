@@ -2,9 +2,11 @@
 use super::tray::Icon;
 use gio::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
+#[path = "launcher_icons.rs"]
+mod icon_theme;
 
 #[derive(Clone)]
 pub struct App {
@@ -14,13 +16,19 @@ pub struct App {
     pub icon_name: String,
     pub icon: Option<Icon>,
 }
-pub const WIDTH: i32 = 570;
-pub const HEIGHT: i32 = 465; // Three full rows, then half of the fourth row's icons.
-pub const ROW_HEIGHT: f64 = 110.0;
-pub const CELL_WIDTH: f64 = 106.0;
+pub const WIDTH: i32 = 600;
+pub const HEIGHT: i32 = 486; // Three full rows, then half of the fourth row's icons.
+pub const ROW_HEIGHT: f64 = 116.0;
+pub const CELL_WIDTH: f64 = 112.0;
+pub const ICON_SIZE: f64 = 48.0;
+pub const ICON_RASTER_SIZE: i32 = 96; // Crisp at both 100% and 150–200% output scale.
+pub const NAME_SIZE: f64 = 13.0;
+pub const NAME_HEIGHT: f64 = 36.0;
+pub const TILE_HEIGHT: f64 = ICON_SIZE + NAME_HEIGHT + 24.0; // Three 8px padding/gap bands.
+pub const LIST_BOTTOM: f64 = 22.0; // Keep exactly half of the fourth 48px icon visible.
 #[derive(Default)]
 pub struct Launcher {
-    pub apps: Vec<App>,
+    apps: Vec<App>,
     pub ready: bool,
     pub query: String,
     pub cursor: usize,
@@ -36,6 +44,21 @@ fn usage_path() -> Option<PathBuf> {
         .map(|p| p.join("lucy/app-usage.json"))
 }
 impl Launcher {
+    pub fn set_apps(&mut self, apps: Vec<App>) {
+        self.apps = apps;
+        self.rank();
+    }
+    fn rank(&mut self) {
+        // Case folding and frequency sorting belong to catalog/ranking changes,
+        // not each hover, scroll frame, or key press.
+        self.apps.sort_by_cached_key(|app| {
+            (
+                std::cmp::Reverse(self.usage.get(&app.id).copied().unwrap_or(0)),
+                app.name.to_lowercase(),
+                app.id.clone(),
+            )
+        });
+    }
     pub fn reset_search(&mut self) {
         self.query.clear();
         self.cursor = 0;
@@ -48,28 +71,20 @@ impl Launcher {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        self.rank();
     }
     pub fn results(&self) -> Vec<&App> {
         let query = self.query.to_lowercase();
         let words: Vec<_> = query.split_whitespace().collect();
-        let mut apps: Vec<_> = self
-            .apps
+        self.apps
             .iter()
             .filter(|a| words.iter().all(|w| a.search.contains(w)))
-            .collect();
-        apps.sort_by(|a, b| {
-            self.usage
-                .get(&b.id)
-                .unwrap_or(&0)
-                .cmp(self.usage.get(&a.id).unwrap_or(&0))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        apps
+            .collect()
     }
     pub fn record(&mut self, id: &str) {
         let count = self.usage.entry(id.into()).or_default();
         *count = count.saturating_add(1);
+        self.rank();
         let Some(path) = usage_path() else {
             return;
         };
@@ -221,18 +236,6 @@ pub fn catalog() -> Vec<App> {
     apps
 }
 pub fn load_icons(apps: &mut [App]) {
-    let names: HashSet<_> = apps
-        .iter()
-        .filter(|a| !a.icon_name.is_empty())
-        .map(|a| a.icon_name.clone())
-        .collect();
-    let mut paths: HashMap<String, PathBuf> = names
-        .iter()
-        .filter_map(|n| {
-            let p = PathBuf::from(n);
-            p.is_absolute().then(|| (n.clone(), p))
-        })
-        .collect();
     let theme = crate::bar_backend::output(
         "gsettings",
         &["get", "org.gnome.desktop.interface", "icon-theme"],
@@ -240,58 +243,23 @@ pub fn load_icons(apps: &mut [App]) {
     .unwrap_or_else(|| "Adwaita".into())
     .trim_matches('\'')
     .to_owned();
-    let home = std::env::var("HOME").unwrap_or_default();
-    for theme in [&theme, "hicolor", "Adwaita"] {
-        for base in [
-            format!("{home}/.local/share/icons"),
-            format!("{home}/.icons"),
-            "/usr/share/icons".into(),
-        ] {
-            index(&PathBuf::from(base).join(theme), &names, &mut paths);
-        }
-    }
-    index(Path::new("/usr/share/pixmaps"), &names, &mut paths);
+    let mut lookup = icon_theme::Lookup::system(&theme);
+    let mut decoded: HashMap<PathBuf, Option<Icon>> = HashMap::new();
     for app in apps {
-        app.icon = paths.get(&app.icon_name).and_then(|p| decode(p));
-    }
-}
-fn index(root: &Path, names: &HashSet<String>, paths: &mut HashMap<String, PathBuf>) {
-    let mut stack = vec![(root.to_owned(), 0)];
-    let mut visited = 0;
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > 60000 {
-                return;
-            }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() && depth < 5 && entry.file_name() != "cursors" {
-                stack.push((path, depth + 1));
-            } else if path
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| ["png", "svg", "xpm"].contains(&s))
-            {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if names.contains(stem) {
-                        paths.entry(stem.into()).or_insert(path);
-                    }
-                }
-            }
-        }
+        app.icon = lookup.resolve(&app.icon_name).and_then(|path| {
+            decoded
+                .entry(path.clone())
+                .or_insert_with(|| decode(&path))
+                .clone()
+        });
     }
 }
 fn decode(path: &Path) -> Option<Icon> {
     if std::fs::metadata(path).ok()?.len() > 2 * 1024 * 1024 {
         return None;
     }
-    let p = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 40, 40, true).ok()?;
+    let p = gdk_pixbuf::Pixbuf::from_file_at_scale(path, ICON_RASTER_SIZE, ICON_RASTER_SIZE, true)
+        .ok()?;
     let (w, h) = (p.width(), p.height());
     let stride = p.rowstride() as usize;
     let n = p.n_channels() as usize;
@@ -309,7 +277,7 @@ fn decode(path: &Path) -> Option<Icon> {
         }
     }
     Some(Icon {
-        bytes,
+        bytes: bytes.into(),
         width: w,
         height: h,
     })
@@ -344,6 +312,7 @@ mod tests {
                 icon: None,
             });
         }
+        l.rank();
         assert_eq!(
             l.results()
                 .iter()
@@ -352,6 +321,7 @@ mod tests {
             vec!["Alpha", "Beta", "Zulu"]
         );
         l.usage.insert("Zulu".into(), 5);
+        l.rank();
         assert_eq!(l.results()[0].name, "Zulu");
         l.insert("alp");
         assert_eq!(l.results()[0].name, "Alpha");

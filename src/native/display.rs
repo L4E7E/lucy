@@ -416,6 +416,70 @@ pub fn validate_placements(outputs: &[Output], positions: &[Placement]) -> Resul
     }
     Ok(())
 }
+/// A draft only: snap beside the nearest monitor, then move the complete group
+/// into positive coordinates. Never send output changes during pointer motion.
+pub fn snap_layout(
+    outputs: &[Output],
+    baseline: &[Placement],
+    name: &str,
+    x: i32,
+    y: i32,
+) -> Option<Vec<Placement>> {
+    let moving = outputs.iter().find(|o| o.name == name)?;
+    let mut candidates = Vec::new();
+    for other in baseline.iter().filter(|p| p.name != name) {
+        let output = outputs.iter().find(|o| o.identity == other.identity)?;
+        let dx = (f64::from(x) + f64::from(moving.logical_width) * 0.5
+            - f64::from(other.x)
+            - f64::from(output.logical_width) * 0.5)
+            / f64::from(moving.logical_width + output.logical_width).max(1.0);
+        let dy = (f64::from(y) + f64::from(moving.logical_height) * 0.5
+            - f64::from(other.y)
+            - f64::from(output.logical_height) * 0.5)
+            / f64::from(moving.logical_height + output.logical_height).max(1.0);
+        let side = if dx.abs() >= dy.abs() {
+            if dx < 0.0 {
+                0
+            } else {
+                1
+            }
+        } else if dy < 0.0 {
+            2
+        } else {
+            3
+        };
+        for (index, (nx, ny)) in [
+            (other.x - moving.logical_width as i32, other.y),
+            (other.x + output.logical_width as i32, other.y),
+            (other.x, other.y - moving.logical_height as i32),
+            (other.x, other.y + output.logical_height as i32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let distance =
+                (i64::from(nx) - i64::from(x)).pow(2) + (i64::from(ny) - i64::from(y)).pow(2);
+            candidates.push((index != side, distance, nx, ny));
+        }
+    }
+    candidates.sort_unstable();
+    for (_, _, x, y) in candidates {
+        let mut draft = baseline.to_vec();
+        let moving = draft.iter_mut().find(|p| p.name == name)?;
+        moving.x = x;
+        moving.y = y;
+        let minx = draft.iter().map(|p| p.x).min()?;
+        let miny = draft.iter().map(|p| p.y).min()?;
+        for p in &mut draft {
+            p.x -= minx;
+            p.y -= miny;
+        }
+        if validate_placements(outputs, &draft).is_ok() {
+            return Some(draft);
+        }
+    }
+    None
+}
 fn restore_layout(before: &[Output]) -> Result<(), String> {
     let mut current = query()?;
     for old in before {
@@ -1012,6 +1076,34 @@ mod tests {
 
     pub fn fixture() -> Value {
         json!({"eDP-1":{"make":"BOE","model":"Internal","serial":"A","modes":[{"width":2560,"height":1600,"refresh_rate":60002},{"width":2560,"height":1600,"refresh_rate":165000}],"current_mode":1,"logical":{"x":0,"y":0,"width":1706,"height":1066,"scale":1.5}},"DP-3":{"make":"Test","model":"External","serial":"B","modes":[{"width":1920,"height":1080,"refresh_rate":74973},{"width":1920,"height":1080,"refresh_rate":59940}],"current_mode":0,"logical":{"x":1706,"y":0,"width":1920,"height":1080,"scale":1.0}}})
+    }
+    #[test]
+    fn snap_external_left_moves_internal_right_before_release_without_writes() {
+        let fake = Fake::new(false);
+        let outputs = query().unwrap();
+        let baseline: Vec<_> = outputs.iter().map(Placement::from_output).collect();
+        let draft = snap_layout(&outputs, &baseline, "DP-3", -200, 0).unwrap();
+        let external = draft.iter().find(|p| p.name == "DP-3").unwrap();
+        let internal = draft.iter().find(|p| p.name == "eDP-1").unwrap();
+        assert_eq!((external.x, external.y), (0, 0));
+        assert_eq!((internal.x, internal.y), (1920, 0));
+        assert!(validate_placements(&outputs, &draft).is_ok());
+        assert!(fake.writes.borrow().is_empty());
+        assert!(same_layout(&outputs, &query().unwrap()));
+        let initial = snap_layout(&outputs, &baseline, "DP-3", 1706, 0).unwrap();
+        assert_eq!(initial.iter().find(|p| p.name == "eDP-1").unwrap().x, 0);
+    }
+    #[test]
+    fn snap_vertical_moves_complete_group_into_canvas_without_overlaps() {
+        let _fake = Fake::new(false);
+        let outputs = query().unwrap();
+        let baseline: Vec<_> = outputs.iter().map(Placement::from_output).collect();
+        for y in [-1200, 1200] {
+            let draft = snap_layout(&outputs, &baseline, "DP-3", 0, y).unwrap();
+            assert!(validate_placements(&outputs, &draft).is_ok());
+            assert_eq!(draft.iter().map(|p| p.y).min(), Some(0));
+            assert!(draft.iter().all(|p| p.x >= 0));
+        }
     }
     struct Fake {
         outputs: Rc<RefCell<Value>>,

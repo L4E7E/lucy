@@ -132,7 +132,7 @@ fn idle_reopen_advances_without_unrelated_input() {
     );
     let launcher = status();
     assert_eq!(launcher["page"], "launcher");
-    assert_eq!(launcher["size"], serde_json::json!([570, 465]));
+    assert_eq!(launcher["size"], serde_json::json!([600, 486]));
     assert_eq!(launcher["launcher_focus"], false);
     println!("launcher: five columns, three full rows and half of the fourth");
 }

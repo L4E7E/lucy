@@ -18,7 +18,7 @@ const XML: &str = r#"<node><interface name="org.kde.StatusNotifierWatcher">
 <signal name="StatusNotifierHostRegistered"/></interface></node>"#;
 #[derive(Clone)]
 pub struct Icon {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub width: i32,
     pub height: i32,
 }
@@ -122,7 +122,7 @@ fn refresh(state: &Arc<Mutex<State>>, id: &str) {
                     d[3] = s[0];
                 }
                 Some(Icon {
-                    bytes: b,
+                    bytes: b.into(),
                     width: w,
                     height: h,
                 })
@@ -262,7 +262,7 @@ fn named_icon(state: &Arc<Mutex<State>>, id: &str, name: &str, theme_path: &str)
                 }
             }
             Some(Icon {
-                bytes,
+                bytes: bytes.into(),
                 width: w,
                 height: h,
             })

@@ -16,6 +16,43 @@ pub struct Background {
     pub sharp: ImageSurface,
     pub blurred: ImageSurface,
 }
+pub fn session_capture(output: &str) -> Option<crate::dismiss::Artwork> {
+    let mut image = capture(output)?.blurred;
+    image.flush();
+    let (width, height, stride) = (image.width(), image.height(), image.stride());
+    let mut pixels = image.data().ok()?.to_vec();
+    session_dim(&mut pixels);
+    Some(crate::dismiss::Artwork {
+        pixels,
+        width,
+        height,
+        stride,
+    })
+}
+
+fn session_dim(pixels: &mut [u8]) {
+    // Match the former premultiplied [5,4,4,76] scrim, but bake it
+    // into opaque pixels so compositor blur/plane selection cannot undo it.
+    for pixel in pixels.chunks_exact_mut(4) {
+        for (channel, tint) in pixel[..3].iter_mut().zip([5u16, 4, 4]) {
+            *channel = ((u16::from(*channel) * 179 + 127) / 255 + tint).min(255) as u8;
+        }
+        pixel[3] = 255;
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    #[test]
+    fn baked_session_scrim_is_opaque_and_preserves_channel_order() {
+        let mut pixels = [0, 0, 0, 255, 255, 255, 255, 255, 100, 150, 200, 255];
+        super::session_dim(&mut pixels);
+        assert_eq!(
+            pixels,
+            [5, 4, 4, 255, 184, 183, 183, 255, 75, 109, 144, 255]
+        );
+    }
+}
 pub fn capture(output: &str) -> Option<Background> {
     let mut child = Command::new("grim")
         // Fractional grim resampling on this GPU costs ~500 ms. Capture the
@@ -138,7 +175,7 @@ pub fn prompt_rect(width: f64, height: f64) -> Rect {
         ..r
     }
 }
-pub fn prompt_mask(font: &str, scale: f64) -> Option<(ImageSurface, Rect)> {
+pub fn prompt_mask(font: &str, scale: f64, busy: bool) -> Option<(ImageSurface, Rect)> {
     let r = prompt_rect(640.0, 480.0);
     let mut image = ImageSurface::create(
         Format::ARgb32,
@@ -152,7 +189,11 @@ pub fn prompt_mask(font: &str, scale: f64) -> Option<(ImageSurface, Rect)> {
         draw::text(
             &cr,
             font,
-            "비밀번호",
+            if busy {
+                "확인 중…"
+            } else {
+                "비밀번호"
+            },
             Rect {
                 x: 0.0,
                 y: 0.0,
@@ -298,7 +339,7 @@ pub fn paint(
     } else {
         "•".repeat(count.min(28))
     };
-    let placeholder = !busy && count == 0;
+    let placeholder = busy || count == 0;
     if placeholder {
         let _ = cr.save();
         let clip = prompt_rect(width, height);
@@ -366,9 +407,31 @@ pub fn paint(
 mod tests {
     use super::*;
     #[test]
+    fn checking_label_matches_placeholder_height_and_has_its_own_shimmer_mask() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut heights = Vec::new();
+            for busy in [false, true] {
+                let (mut image, bounds) = prompt_mask("Sans 11", scale, busy).unwrap();
+                assert_eq!(bounds.h, 54.0);
+                let (w, h, stride) = (
+                    image.width() as usize,
+                    image.height() as usize,
+                    image.stride() as usize,
+                );
+                let bytes = image.data().unwrap();
+                let rows: Vec<_> = (0..h)
+                    .filter(|&y| (0..w).any(|x| bytes[y * stride + x * 4 + 3] != 0))
+                    .collect();
+                heights.push((rows[0], *rows.last().unwrap()));
+            }
+            assert!(heights[0].0.abs_diff(heights[1].0) <= 1);
+            assert!(heights[0].1.abs_diff(heights[1].1) <= 1);
+        }
+    }
+    #[test]
     fn placeholder_shimmer_mask_excludes_blank_entry_margins_at_each_scale() {
         for scale in [1.0, 1.5, 2.0] {
-            let (mut image, bounds) = prompt_mask("Sans 11", scale).unwrap();
+            let (mut image, bounds) = prompt_mask("Sans 11", scale, false).unwrap();
             assert!(bounds.w > 30.0 && bounds.w < 100.0);
             assert!(bounds.x > 80.0);
             assert!((f64::from(image.width()) - bounds.w * scale).abs() < 0.001);

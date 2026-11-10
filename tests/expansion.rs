@@ -37,6 +37,8 @@ fn bar_surface_expands_and_returns_without_replacement() {
     // Set LUCY_TEST_INPUT=1 to test real body controls with the outside-click
     // catcher enabled. Pass-through previews alone cannot catch input stacking bugs.
     let input = std::env::var_os("LUCY_TEST_INPUT").is_some();
+    let osd_only = std::env::var_os("LUCY_TEST_OSD_ONLY").is_some();
+    let monitor_only = std::env::var_os("LUCY_TEST_MONITOR_ONLY").is_some();
     let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
     let display = if display.is_absolute() {
@@ -95,7 +97,7 @@ fn bar_surface_expands_and_returns_without_replacement() {
     let initial = status();
     let bars = initial["bars"].as_array().unwrap();
     let mut pointer = None;
-    for cycle in 0..8 {
+    for cycle in 0..if osd_only || monitor_only { 0 } else { 8 } {
         let (page, side, width) = if cycle % 2 == 0 {
             ("home", "right", 480)
         } else {
@@ -112,7 +114,7 @@ fn bar_surface_expands_and_returns_without_replacement() {
             "must borrow an original surface on the chosen output"
         );
         assert!(opened["borrowed_from"].is_number());
-        assert_eq!(opened["size"][1], 500);
+        assert_eq!(opened["size"][1], 500, "cycle {cycle}: {opened}");
         assert_eq!(
             opened["expanding"], false,
             "buttons must be interactive after settling"
@@ -159,7 +161,9 @@ fn bar_surface_expands_and_returns_without_replacement() {
                     }
                     println!("detail navigation pushes left, Back pushes right, and the glass/header stay fixed");
                 }
-                p.click(x + 444.0, 374.0);
+                // Joined inset (24) + the current compact media/audio row (357)
+                // + output margin (6): click the gear itself, not above it.
+                p.click(x + 444.0, 387.0);
                 let clicked = status();
                 assert_eq!(
                     clicked["visible"], true,
@@ -194,14 +198,14 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 );
             } else {
                 let x = (p.width - opened["size"][0].as_f64().unwrap()) / 2.0;
-                p.click(x + 38.0, 125.0);
+                p.click(x + 38.0, 139.0);
                 let clicked = status();
                 assert_eq!(
                     clicked["visible"], true,
                     "calendar click must not hit the backdrop"
                 );
                 assert_eq!(clicked["calendar_offset"], -1);
-                p.click(x + 282.0, 125.0);
+                p.click(x + 282.0, 139.0);
                 assert_eq!(status()["calendar_offset"], 0);
                 p.wheel(x + 166.0, 200.0, 15.0);
                 assert_eq!(status()["calendar_offset"], 1);
@@ -260,6 +264,7 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 println!("Ethernet/VPN: glass cards use Wi-Fi's 32x32 link/X actions; preview remains read-only");
             }
         }
+        let before_close = status();
         socket.send_to(b"@hide", &server).unwrap();
         thread::sleep(Duration::from_millis(100));
         if std::env::var_os("LUCY_SOFTWARE").is_none() {
@@ -267,6 +272,23 @@ fn bar_surface_expands_and_returns_without_replacement() {
             assert_eq!(mid["closing"], true);
             let h = mid["size"][1].as_i64().unwrap();
             assert!(h > 34 && h < 500, "closing must actually shrink: {mid}");
+            if page == "calendar" {
+                let rasterized = |state: &serde_json::Value| {
+                    state["surfaces"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|w| w["surface"] == source)
+                        .unwrap()["rasterized"]
+                        .as_u64()
+                        .unwrap()
+                };
+                assert_eq!(
+                    rasterized(&mid),
+                    rasterized(&before_close),
+                    "calendar collapse must use cached GPU textures, not repaint each frame"
+                );
+            }
         }
         thread::sleep(Duration::from_millis(250));
         let closed = status();
@@ -280,10 +302,195 @@ fn bar_surface_expands_and_returns_without_replacement() {
             .unwrap();
         assert_eq!(returned["surface"], source);
         assert_eq!(returned["size"][1], 34);
+        if page == "calendar" {
+            let original = bars.iter().find(|b| b["surface"] == source).unwrap();
+            assert_eq!(
+                returned["size"], original["size"],
+                "calendar must restore the full date bar width, not the HH:MM widget width"
+            );
+        }
         assert_eq!(closed["bars"].as_array().unwrap().len(), bars.len());
         println!("cycle {cycle}: {side} surface preserved, expanded, and restored");
     }
-    if std::env::var_os("LUCY_SOFTWARE").is_none() {
+    if !osd_only {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let closed = loop {
+            let state = status();
+            if state["system_targets"].as_array().is_some_and(|targets| {
+                targets.len() == bars.iter().filter(|b| b["side"] == "right").count()
+            }) {
+                break state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bar metrics did not become ready"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        let targets = closed["system_targets"].as_array().unwrap();
+        assert_eq!(
+            targets.len(),
+            bars.iter().filter(|b| b["side"] == "right").count()
+        );
+        for target in targets {
+            let source = &target["surface"];
+            if input {
+                // Live numeric metrics may change the bar width while the
+                // previous output is being tested. Click its current geometry.
+                let current = status();
+                let target = current["system_targets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["surface"] == *source)
+                    .unwrap();
+                let mut p = pointer::Pointer::new(target["output"].as_str().unwrap());
+                let r = &target["rect"];
+                p.click(
+                    p.width - 8.0 - target["width"].as_f64().unwrap()
+                        + r[0].as_f64().unwrap()
+                        + r[2].as_f64().unwrap() / 2.0,
+                    6.0 + r[1].as_f64().unwrap() + r[3].as_f64().unwrap() / 2.0,
+                );
+            } else {
+                socket.send_to(b"system", &server).unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let opened = loop {
+                let state = status();
+                if state["monitor"]["cpu"].is_number()
+                    && state["size"][1] == 500
+                    && state["expanding"] == false
+                {
+                    break state;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "monitor did not become ready: {state}"
+                );
+                thread::sleep(Duration::from_millis(25));
+            };
+            assert_eq!(opened["page"], "system", "target {target}: {opened}");
+            if input {
+                assert_eq!(
+                    &opened["surface"], source,
+                    "system click must borrow that output's original bar surface"
+                );
+            }
+            assert!(opened["monitor"]["threads"]
+                .as_array()
+                .is_some_and(|t| !t.is_empty()));
+            assert!(opened["monitor"]["memory"]["total"].as_u64().unwrap() > 0);
+            assert!(
+                opened["monitor"]["disk"]["usage"]["total"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            println!("monitor GPU telemetry: {}", opened["monitor"]["gpus"]);
+            if std::env::var_os("LUCY_TEST_NVIDIA").is_some() {
+                let gpus = opened["monitor"]["gpus"].as_array().unwrap();
+                let nvidia = gpus
+                    .iter()
+                    .find(|g| g["name"].as_str().is_some_and(|s| s.starts_with("NVIDIA")))
+                    .expect("active NVIDIA telemetry must resolve its actual name through NVML");
+                assert!(nvidia["usage"].is_number());
+                assert!(nvidia["temperature"].is_number());
+                assert!(nvidia["vram"]["total"].as_u64().is_some_and(|n| n > 0));
+            }
+            if let Some(directory) = std::env::var_os("LUCY_MONITOR_SCREENSHOTS") {
+                let output = bars
+                    .iter()
+                    .find(|b| b["surface"] == opened["surface"])
+                    .unwrap()["output"]
+                    .as_str()
+                    .unwrap();
+                let raw = Command::new("niri")
+                    .args(["msg", "-j", "outputs"])
+                    .output()
+                    .unwrap();
+                assert!(raw.status.success());
+                let outputs: serde_json::Value = serde_json::from_slice(&raw.stdout).unwrap();
+                let logical = &outputs[output]["logical"];
+                let width = opened["size"][0].as_i64().unwrap();
+                let x =
+                    logical["x"].as_i64().unwrap() + logical["width"].as_i64().unwrap() - 8 - width;
+                let y = logical["y"].as_i64().unwrap() + 6;
+                assert!(Command::new("grim")
+                    .args([
+                        "-s",
+                        &logical["scale"].to_string(),
+                        "-g",
+                        &format!("{x},{y} {width}x500")
+                    ])
+                    .arg(PathBuf::from(directory).join(format!("monitor-{output}.png")))
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let sequence = opened["monitor"]["sequence"].as_u64().unwrap();
+            thread::sleep(Duration::from_millis(600));
+            assert!(status()["monitor"]["sequence"].as_u64().unwrap() > sequence);
+            if opened["gpu_gauges"].as_u64().is_some_and(|n| n > 0) {
+                let rasterized = |state: &serde_json::Value| {
+                    state["surfaces"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|w| w["surface"] == opened["surface"])
+                        .unwrap()["rasterized"]
+                        .as_u64()
+                        .unwrap()
+                };
+                let before = status();
+                thread::sleep(Duration::from_millis(1600));
+                let after = status();
+                let samples = after["monitor"]["sequence"].as_u64().unwrap()
+                    - before["monitor"]["sequence"].as_u64().unwrap();
+                let rasters = rasterized(&after) - rasterized(&before);
+                assert!(samples >= 2);
+                assert!(
+                    rasters <= samples + 4,
+                    "GPU gauges must not rerasterize the whole scene per frame: {rasters} rasters / {samples} samples"
+                );
+                println!("GPU gauges: {rasters} scene updates for {samples} telemetry samples; animation does not rerasterize text/background");
+                socket.send_to(b"home", &server).unwrap();
+                thread::sleep(Duration::from_millis(65));
+                let leaving = status();
+                assert_eq!(leaving["surface"], opened["surface"]);
+                assert_eq!(leaving["animation"], "SlideBack");
+                assert_eq!(leaving["gpu_gauges"], 0);
+                assert_eq!(leaving["monitor"]["active"], false);
+                thread::sleep(Duration::from_millis(300));
+                socket.send_to(b"system", &server).unwrap();
+                thread::sleep(Duration::from_millis(65));
+                let returning = status();
+                assert_eq!(returning["surface"], opened["surface"]);
+                assert_eq!(returning["animation"], "Slide");
+                assert!(returning["gpu_gauges"].as_u64().is_some_and(|n| n > 0));
+                thread::sleep(Duration::from_millis(300));
+            }
+            socket.send_to(b"@hide", &server).unwrap();
+            thread::sleep(Duration::from_millis(400));
+            let closed = status();
+            assert_eq!(closed["monitor"]["active"], false);
+            let sequence = closed["monitor"]["sequence"].clone();
+            thread::sleep(Duration::from_millis(650));
+            assert_eq!(
+                status()["monitor"]["sequence"],
+                sequence,
+                "hidden monitor must stop sampling"
+            );
+            println!("system monitor: live CPU/RAM/disk, original bar surface, same panel size, hidden sampling stopped");
+            if !input {
+                break;
+            }
+        }
+    }
+    if monitor_only {
+        return;
+    }
+    if std::env::var_os("LUCY_SOFTWARE").is_none() && !osd_only {
         socket.send_to(b"home", &server).unwrap();
         thread::sleep(Duration::from_millis(560));
         let before = status();
@@ -332,12 +539,18 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 .unwrap_or_else(|| panic!("missing {prefix} surface: {s}"))
                 .clone()
         };
-        let center = bars.iter().find(|b| b["side"] == "center").unwrap()["surface"].clone();
+        let mut center = serde_json::Value::Null;
         for _ in 0..3 {
             socket.send_to(b"@preview-toast", &server).unwrap();
             thread::sleep(Duration::from_millis(100));
             let mid = status();
             let toast = surface(&mid, "CenterOverlay");
+            if center.is_null() {
+                center = toast["surface"].clone();
+                assert!(bars
+                    .iter()
+                    .any(|b| b["side"] == "center" && b["surface"] == center));
+            }
             assert_eq!(
                 toast["surface"], center,
                 "notification must grow from the actual clock bar"
@@ -371,21 +584,41 @@ fn bar_surface_expands_and_returns_without_replacement() {
             let osd = surface(&mid, "CenterOverlay");
             assert_eq!(osd["surface"], center);
             assert_eq!(osd["size"][1], 34, "OSD may only expand horizontally");
+            let source_width = bars.iter().find(|b| b["surface"] == center).unwrap()["size"][0]
+                .as_i64()
+                .unwrap();
+            let target_width = (source_width + 60).max(236);
+            assert!(
+                osd["size"][0].as_i64().unwrap() < target_width - 20,
+                "OSD must not finish expanding during the first 100ms: {osd}"
+            );
+            let mut widths = std::collections::BTreeSet::new();
+            widths.insert(osd["size"][0].as_i64().unwrap());
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(60));
+                let sample = surface(&status(), "CenterOverlay");
+                widths.insert(sample["size"][0].as_i64().unwrap());
+            }
+            assert!(
+                widths.len() >= 3,
+                "OSD skipped its intermediate widths: {widths:?}"
+            );
             assert_eq!(mid["osd"]["kind"], kind);
             if kind == "keyboard" {
                 assert_eq!(mid["osd"]["label"], "2단계");
                 assert_eq!(mid["osd"]["step"], 2);
             }
-            thread::sleep(Duration::from_millis(350));
+            thread::sleep(Duration::from_millis(230));
             let settled = surface(&status(), "CenterOverlay");
-            let source_width = bars.iter().find(|b| b["surface"] == center).unwrap()["size"][0]
-                .as_i64()
-                .unwrap();
             assert_eq!(
                 settled["size"],
                 serde_json::json!([(source_width + 60).max(236), 34])
             );
             assert_eq!(settled["animating"], false);
+            assert!(
+                settled["presented"].as_u64().unwrap() >= osd["presented"].as_u64().unwrap() + 8,
+                "OSD must deliver intermediate compositor-paced frames: {settled}"
+            );
             socket.send_to(b"@preview-osd-clear", &server).unwrap();
             thread::sleep(Duration::from_millis(350));
             assert!(status()["bars"]
@@ -395,11 +628,39 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 .any(|b| b["surface"] == center && b["size"][1] == 34));
         }
         println!("all five compact OSDs reuse and restore the actual clock surface");
-        let before = surface(&status(), "Bar(\"left\"");
+        if osd_only {
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(status()["frame_pump"], false);
+            println!("OSD-only checks complete; no idle animation timer remains");
+            return;
+        }
+        let before: std::collections::BTreeMap<_, _> = status()["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["role"].as_str().unwrap().starts_with("Bar(\"left\""))
+            .map(|w| {
+                (
+                    w["surface"].as_u64().unwrap(),
+                    w["presented"].as_u64().unwrap(),
+                )
+            })
+            .collect();
         socket.send_to(b"@preview-indicator", &server).unwrap();
         thread::sleep(Duration::from_millis(420));
-        let after = surface(&status(), "Bar(\"left\"");
-        let frames = after["presented"].as_u64().unwrap() - before["presented"].as_u64().unwrap();
+        // The fixture changes one output, not the first entry of another HashMap.
+        let state = status();
+        let after = state["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["role"].as_str().unwrap().starts_with("Bar(\"left\""))
+            .max_by_key(|w| {
+                w["presented"].as_u64().unwrap() - before[&w["surface"].as_u64().unwrap()]
+            })
+            .unwrap();
+        let frames =
+            after["presented"].as_u64().unwrap() - before[&after["surface"].as_u64().unwrap()];
         assert!(
             frames > 4,
             "indicator must animate independently of any open panel"
