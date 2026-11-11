@@ -8,6 +8,8 @@ pub(super) struct Renderer {
     clip: Option<glow::NativeUniformLocation>,
     style: Option<glow::NativeUniformLocation>,
     edge: Option<glow::NativeUniformLocation>,
+    scene: Option<glow::NativeUniformLocation>,
+    scene_layout: Option<glow::NativeUniformLocation>,
 }
 impl Renderer {
     pub(super) unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
@@ -28,6 +30,8 @@ uniform vec4 bounds;
 uniform vec4 clip;
 uniform vec4 style;
 uniform float pixel;
+uniform sampler2D sceneImage;
+uniform vec4 sceneLayout;
 float rounded(vec2 p,vec4 r,float radius){
     vec2 d=abs(p-r.xy-r.zw*0.5)-(r.zw*0.5-vec2(radius));
     return length(max(d,vec2(0.0)))+min(max(d.x,d.y),0.0)-radius;
@@ -40,7 +44,15 @@ void main(){
     float distance=max(rounded(point,bounds,style.w),rounded(point,fill,radius));
     distance=max(distance,rounded(point,vec4(0.0,0.0,frame.xy),min(20.0,min(frame.x,frame.y)*0.5)));
     float alpha=(1.0-smoothstep(-pixel*0.5,pixel*0.5,distance))*style.z*frame.z;
-    gl_FragColor=vec4(vec3(0.96,0.97,1.0)*alpha,alpha);
+    vec3 color=vec3(1.0);
+    if(style.y<0.5){
+        // The capsule's known base alpha isolates exact cached glyph coverage.
+        // Unlike Difference blending this leaves the fill white, not gray.
+        float base=texture2D(sceneImage,(point-sceneLayout.xy)*sceneLayout.zw).a;
+        float ink=clamp((base-frame.w)/(1.0-frame.w),0.0,1.0);
+        color=mix(vec3(1.0),vec3(0.12,0.13,0.15),ink);
+    }
+    gl_FragColor=vec4(color*alpha,alpha);
 }"#;
         let program = gl.create_program()?;
         for (kind, source) in [
@@ -73,8 +85,11 @@ void main(){
             clip: gl.get_uniform_location(program, "clip"),
             style: gl.get_uniform_location(program, "style"),
             edge: gl.get_uniform_location(program, "pixel"),
+            scene: gl.get_uniform_location(program, "sceneImage"),
+            scene_layout: gl.get_uniform_location(program, "sceneLayout"),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn paint(
         &self,
         gl: &glow::Context,
@@ -83,6 +98,7 @@ void main(){
         offset: (f32, f32),
         alpha: f32,
         pixel: f32,
+        scene_unit: i32,
     ) {
         if batch.items.is_empty() || alpha <= 0.0 {
             return;
@@ -91,8 +107,22 @@ void main(){
         gl.use_program(Some(self.program));
         gl.enable(glow::BLEND);
         gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-        gl.uniform_4_f32(self.frame.as_ref(), frame.0, frame.1, alpha, 0.0);
+        gl.uniform_4_f32(
+            self.frame.as_ref(),
+            frame.0,
+            frame.1,
+            alpha,
+            crate::gauge::TRACK_ALPHA as f32,
+        );
         gl.uniform_1_f32(self.edge.as_ref(), pixel);
+        gl.uniform_1_i32(self.scene.as_ref(), scene_unit);
+        gl.uniform_4_f32(
+            self.scene_layout.as_ref(),
+            offset.0,
+            offset.1,
+            1.0 / batch.size.0.max(1.0),
+            1.0 / batch.size.1.max(1.0),
+        );
         for motion in &batch.items {
             let g = &motion.gauge;
             let r = g.rect;

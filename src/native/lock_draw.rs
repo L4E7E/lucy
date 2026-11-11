@@ -16,43 +16,6 @@ pub struct Background {
     pub sharp: ImageSurface,
     pub blurred: ImageSurface,
 }
-pub fn session_capture(output: &str) -> Option<crate::dismiss::Artwork> {
-    let mut image = capture(output)?.blurred;
-    image.flush();
-    let (width, height, stride) = (image.width(), image.height(), image.stride());
-    let mut pixels = image.data().ok()?.to_vec();
-    session_dim(&mut pixels);
-    Some(crate::dismiss::Artwork {
-        pixels,
-        width,
-        height,
-        stride,
-    })
-}
-
-fn session_dim(pixels: &mut [u8]) {
-    // Match the former premultiplied [5,4,4,76] scrim, but bake it
-    // into opaque pixels so compositor blur/plane selection cannot undo it.
-    for pixel in pixels.chunks_exact_mut(4) {
-        for (channel, tint) in pixel[..3].iter_mut().zip([5u16, 4, 4]) {
-            *channel = ((u16::from(*channel) * 179 + 127) / 255 + tint).min(255) as u8;
-        }
-        pixel[3] = 255;
-    }
-}
-
-#[cfg(test)]
-mod session_tests {
-    #[test]
-    fn baked_session_scrim_is_opaque_and_preserves_channel_order() {
-        let mut pixels = [0, 0, 0, 255, 255, 255, 255, 255, 100, 150, 200, 255];
-        super::session_dim(&mut pixels);
-        assert_eq!(
-            pixels,
-            [5, 4, 4, 255, 184, 183, 183, 255, 75, 109, 144, 255]
-        );
-    }
-}
 pub fn capture(output: &str) -> Option<Background> {
     let mut child = Command::new("grim")
         // Fractional grim resampling on this GPU costs ~500 ms. Capture the

@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 pub const DURATION: Duration = Duration::from_millis(240);
+// Horizontal tracks have a known alpha. Cached glyph coverage can therefore be
+// recovered exactly from the scene alpha, without another mask texture/upload.
+pub const TRACK_ALPHA: f64 = 0.64;
 #[derive(Clone, Debug)]
 pub struct Gauge {
     pub key: String,
@@ -14,6 +17,8 @@ pub struct Gauge {
     pub vertical: bool,
     pub alpha: f32,
     pub level: f32,
+    /// Pointer scrubbing and unacknowledged seeks must show their exact target.
+    pub direct: bool,
 }
 #[derive(Clone)]
 pub struct Motion {
@@ -57,10 +62,15 @@ impl Batch {
                     let mut motion = old.swap_remove(index);
                     let value = motion.value(now);
                     changed |= motion.gauge.level != spec.level
+                        || motion.gauge.direct != spec.direct
                         || motion.gauge.alpha != spec.alpha
                         || bounds(motion.gauge.rect) != bounds(spec.rect)
                         || bounds(motion.gauge.clip) != bounds(spec.clip);
-                    if motion.gauge.level != spec.level {
+                    if spec.direct {
+                        motion.from = spec.level;
+                        motion.at = now;
+                        motion.last.set(1.0);
+                    } else if motion.gauge.level != spec.level {
                         motion.from = value;
                         motion.at = now;
                         motion.last.set(0.0);
@@ -128,6 +138,7 @@ mod tests {
             vertical: true,
             alpha: 0.82,
             level,
+            direct: false,
         }
     }
     #[test]
@@ -145,6 +156,22 @@ mod tests {
         assert!((batch.items[0].value(mid + DURATION) - 0.2).abs() < 0.0001);
         batch.presented(mid + DURATION);
         assert!(!batch.items[0].moving(mid + DURATION));
+    }
+    #[test]
+    fn direct_scrubbing_cancels_old_motion_and_releases_without_a_jump() {
+        let now = Instant::now();
+        let mut batch = Batch::default();
+        batch.update_at(vec![spec(0.2)], (480.0, 500.0), now);
+        batch.update_at(vec![spec(0.8)], (480.0, 500.0), now);
+        let mid = now + Duration::from_millis(50);
+        let mut pointer = spec(0.41125);
+        pointer.direct = true;
+        batch.update_at(vec![pointer], (480.0, 500.0), mid);
+        assert_eq!(batch.items[0].value(mid), 0.41125);
+        assert!(!batch.items[0].moving(mid));
+        batch.update_at(vec![spec(0.41125)], (480.0, 500.0), mid);
+        assert_eq!(batch.items[0].value(mid), 0.41125);
+        assert!(!batch.items[0].moving(mid));
     }
     #[test]
     fn static_unchanged_and_cleared_gauges_request_no_extra_frames() {

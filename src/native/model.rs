@@ -284,6 +284,12 @@ struct DisplayDrag {
     floating: (i32, i32),
     preview: Option<Vec<display::Placement>>,
 }
+struct DisplaySliderDraft {
+    target: Slider,
+    identity: Option<String>,
+    percent: f64,
+    sent: Option<(u32, u64)>,
+}
 pub struct Model {
     pub display: display::State,
     pub display_tx: Option<mpsc::Sender<display::Request>>,
@@ -292,6 +298,9 @@ pub struct Model {
     pub display_identify: bool,
     display_clock_wheel: Option<ClockWheel>,
     display_time_draft: Option<(u32, u32, Instant)>,
+    display_slider_drafts: Vec<DisplaySliderDraft>,
+    display_slider_serial: u64,
+    display_last_write: Instant,
     pub display_layout: Vec<display::Placement>,
     display_drag: Option<DisplayDrag>,
     pub gamma_supported: bool,
@@ -557,6 +566,7 @@ impl Model {
         }
     }
     pub fn display_state(&mut self, mut state: display::State) {
+        self.display_slider_serial = self.display_slider_serial.max(state.slider_serial);
         if let Some((start, end, at)) = self.display_time_draft {
             if !state.error.is_empty()
                 || (state.settings.night.start == start && state.settings.night.end == end)
@@ -585,15 +595,232 @@ impl Model {
             self.display_drag = None;
             self.display_menu = None;
         }
-        if self.dragging.is_some() || Instant::now() < self.quiet {
+        if matches!(self.dragging, Some((_, Slider::Brightness, _))) || Instant::now() < self.quiet
+        {
             for output in &mut state.outputs {
-                if let Some(old) = self.display.outputs.iter().find(|o| o.name == output.name) {
+                if !matches!(output.control, Some(display::Brightness::Backlight(_)))
+                    || self
+                        .display_slider_drafts
+                        .iter()
+                        .any(|draft| draft.identity.as_ref() == Some(&output.identity))
+                {
+                    continue;
+                }
+                if let Some(old) = self
+                    .display
+                    .outputs
+                    .iter()
+                    .find(|o| o.identity == output.identity)
+                {
                     output.brightness = old.brightness;
                 }
             }
-            state.settings.night.kelvin = self.display.settings.night.kelvin;
+        }
+        self.display_slider_drafts.retain(|draft| {
+            if let Slider::DisplayBrightness(name) = &draft.target {
+                if !state.outputs.iter().any(|o| {
+                    &o.name == name
+                        && Some(&o.identity) == draft.identity.as_ref()
+                        && o.control.is_some()
+                }) {
+                    return false;
+                }
+            }
+            let dragging = self
+                .dragging
+                .as_ref()
+                .is_some_and(|(_, target, _)| target == &draft.target);
+            dragging
+                || draft
+                    .sent
+                    .is_none_or(|(_, serial)| state.slider_serial < serial)
+        });
+        for draft in &self.display_slider_drafts {
+            match &draft.target {
+                Slider::DisplayBrightness(name) => {
+                    if let Some(o) = state.outputs.iter_mut().find(|o| &o.name == name) {
+                        o.brightness = Some(draft.percent);
+                    }
+                }
+                Slider::Temperature => {
+                    state.settings.night.kelvin = self.display.settings.night.kelvin;
+                }
+                _ => unreachable!(),
+            }
         }
         self.display = state;
+    }
+    pub fn display_gauge_value(&self, target: &Slider, value: f64) -> f64 {
+        let value = self
+            .display_slider_drafts
+            .iter()
+            .find(|draft| &draft.target == target)
+            .map_or(value, |draft| draft.percent);
+        let key = match target {
+            Slider::DisplayBrightness(name) => format!(
+                "display-brightness-{}",
+                self.display
+                    .outputs
+                    .iter()
+                    .find(|o| &o.name == name)
+                    .map_or(name.as_str(), |o| o.identity.as_str())
+            ),
+            Slider::Temperature => "display-temperature".into(),
+            _ => return value,
+        };
+        self.gauge_motion(&key, value, self.dragging_slider(target))
+    }
+    fn dragging_slider(&self, target: &Slider) -> bool {
+        self.dragging.as_ref().is_some_and(|(_, t, _)| t == target)
+    }
+    fn gauge_motion(&self, key: &str, value: f64, direct: bool) -> f64 {
+        let value = if value.is_finite() {
+            value.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        if direct {
+            // Pointer samples never chase an easing curve. Seed the next wheel
+            // or backend transition from the exact last displayed position.
+            self.icon_values
+                .borrow_mut()
+                .insert(key.into(), (value, value, Instant::now()));
+            value
+        } else {
+            self.motion_value(key, value, Duration::from_millis(100))
+        }
+    }
+    pub fn slider_value(&self, target: &Slider, value: f64) -> f64 {
+        if matches!(target, Slider::DisplayBrightness(_) | Slider::Temperature) {
+            return self.display_gauge_value(target, value);
+        }
+        // Playback already has its own monotonic microsecond clock and seek
+        // acknowledgement. Do not turn it into an endlessly retargeted easing.
+        if matches!(target, Slider::Media(_, _)) {
+            return value;
+        }
+        self.gauge_motion(
+            &format!("gauge:{target:?}"),
+            value,
+            self.dragging_slider(target),
+        )
+    }
+    pub fn slider_level(&self, target: &Slider) -> f64 {
+        match target {
+            Slider::Volume => self.common.audio.map_or(0.0, |a| a.0),
+            Slider::Brightness => self.common.brightness.unwrap_or(0.0),
+            Slider::DisplayBrightness(name) => self
+                .display
+                .outputs
+                .iter()
+                .find(|o| &o.name == name)
+                .and_then(|o| o.brightness)
+                .unwrap_or(0.0),
+            Slider::Temperature => self.display.settings.night.percent(),
+            Slider::Media(_, _) => self.media_progress(),
+            Slider::Audio(kind, id) => self.audio[collection(kind)]
+                .as_array()
+                .and_then(|v| v.iter().find(|a| a["index"].as_u64() == Some(*id)))
+                .map_or(0.0, audio::volume),
+        }
+    }
+    pub fn readout_value(&self, key: &str, value: f64) -> f64 {
+        self.gauge_motion(&format!("gauge:{key}"), value, false)
+    }
+    pub fn reset_readout(&self, key: &str, value: f64) {
+        self.gauge_motion(&format!("gauge:{key}"), value, true);
+    }
+    fn display_slider(&mut self, target: &Slider, value: f64, force: bool) {
+        if !value.is_finite() {
+            return;
+        }
+        let (percent, identity, v) = match target {
+            Slider::DisplayBrightness(name) => {
+                let Some(o) = self
+                    .display
+                    .outputs
+                    .iter_mut()
+                    .find(|o| &o.name == name && o.control.is_some())
+                else {
+                    return;
+                };
+                let percent = value.clamp(1.0, 100.0);
+                o.brightness = Some(percent);
+                if matches!(o.control, Some(display::Brightness::Backlight(_))) {
+                    self.common.brightness = o.brightness;
+                }
+                (percent, Some(o.identity.clone()), percent.round() as u32)
+            }
+            Slider::Temperature => {
+                let percent = value.clamp(0.0, 100.0);
+                let kelvin = display::MIN_KELVIN
+                    + ((percent / 100.0 * f64::from(display::MAX_KELVIN - display::MIN_KELVIN)
+                        / 50.0)
+                        .round() as u32)
+                        * 50;
+                self.display.settings.night.kelvin = kelvin;
+                (percent, None, kelvin)
+            }
+            _ => unreachable!(),
+        };
+        // Select immediate presentation for pointer samples too. Start this
+        // finite window only on input, never from a frame that samples the gauge.
+        self.animation_until.set(
+            self.animation_until
+                .get()
+                .max(Instant::now() + Duration::from_millis(100)),
+        );
+        let index = self
+            .display_slider_drafts
+            .iter()
+            .position(|draft| &draft.target == target);
+        let draft = if let Some(index) = index {
+            &mut self.display_slider_drafts[index]
+        } else {
+            self.display_slider_drafts.push(DisplaySliderDraft {
+                target: target.clone(),
+                identity: identity.clone(),
+                percent,
+                sent: None,
+            });
+            self.display_slider_drafts.last_mut().unwrap()
+        };
+        let unchanged = draft.identity == identity && draft.sent.is_some_and(|(old, _)| old == v);
+        draft.identity = identity;
+        draft.percent = percent;
+        if !unchanged {
+            draft.sent = None;
+        }
+        // Drawing never enters this path. Backend work is driven only by input,
+        // rate limited during dragging, coalesced by the worker, and flushed on release.
+        if self.readonly
+            || (!force
+                && (unchanged || self.display_last_write.elapsed() < Duration::from_millis(35)))
+        {
+            return;
+        }
+        let Some(tx) = &self.display_tx else {
+            return;
+        };
+        self.display_slider_serial += 1;
+        let serial = self.display_slider_serial;
+        let request = match target {
+            Slider::DisplayBrightness(name) => {
+                display::Request::Brightness(name.clone(), v, serial)
+            }
+            Slider::Temperature => display::Request::Temperature(v, serial),
+            _ => unreachable!(),
+        };
+        match tx.send(request) {
+            Ok(()) => {
+                draft.sent = Some((v, serial));
+                self.display_last_write = Instant::now();
+            }
+            Err(_) => {
+                self.display.error = "디스플레이 제어 연결이 종료되었습니다".into();
+                self.display_slider_drafts.clear();
+            }
+        }
     }
     pub fn power_send(&self, request: power::Request) {
         if !self.readonly {
@@ -740,6 +967,9 @@ impl Model {
             display_identify: false,
             display_clock_wheel: None,
             display_time_draft: None,
+            display_slider_drafts: vec![],
+            display_slider_serial: 0,
+            display_last_write: Instant::now() - Duration::from_secs(1),
             display_layout: vec![],
             display_drag: None,
             gamma_supported: false,
@@ -958,10 +1188,12 @@ impl Model {
         if self.profile_pending {
             next.profile = self.common.profile.clone();
         }
-        if Instant::now() < self.quiet {
+        if Instant::now() < self.quiet || self.dragging_slider(&Slider::Volume) {
             if let (Some((_, muted)), Some((percent, _))) = (next.audio, self.common.audio) {
                 next.audio = Some((percent, muted));
             }
+        }
+        if Instant::now() < self.quiet || self.dragging_slider(&Slider::Brightness) {
             next.brightness = self.common.brightness;
         }
         if !matches!(self.dragging, Some((_, Slider::DisplayBrightness(_), _))) {
@@ -973,7 +1205,12 @@ impl Model {
                 .count();
             if internal == 1 {
                 for output in &mut self.display.outputs {
-                    if matches!(output.control, Some(display::Brightness::Backlight(_))) {
+                    if matches!(output.control, Some(display::Brightness::Backlight(_)))
+                        && !self.display_slider_drafts.iter().any(|draft| {
+                            draft.identity.as_ref() == Some(&output.identity)
+                                && draft.target == Slider::DisplayBrightness(output.name.clone())
+                        })
+                    {
                         output.brightness = next.brightness;
                     }
                 }
@@ -983,13 +1220,17 @@ impl Model {
         self.scan_wifi_on_entry();
     }
     fn write(&self, a: control::Action) {
-        if let Some(tx) = &self.common_tx {
-            let _ = tx.send(control::Request::Write(a));
+        if !self.readonly {
+            if let Some(tx) = &self.common_tx {
+                let _ = tx.send(control::Request::Write(a));
+            }
         }
     }
     fn audio_write(&self, args: Vec<String>) {
-        if let Some(tx) = &self.audio_tx {
-            let _ = tx.send(audio::Request::Write(args));
+        if !self.readonly {
+            if let Some(tx) = &self.audio_tx {
+                let _ = tx.send(audio::Request::Write(args));
+            }
         }
     }
     pub fn hide(&mut self) {
@@ -1539,6 +1780,13 @@ impl Model {
         }
     }
     pub fn slider(&mut self, target: &Slider, value: f64, force: bool) {
+        if !value.is_finite() {
+            return;
+        }
+        if matches!(target, Slider::DisplayBrightness(_) | Slider::Temperature) {
+            self.display_slider(target, value, force);
+            return;
+        }
         if let Slider::Media(player, track) = target {
             if !value.is_finite() {
                 return;
@@ -1567,35 +1815,27 @@ impl Model {
             }
             return;
         }
-        let v = value.round().clamp(
+        let percent = value.clamp(
             if matches!(target, Slider::Brightness | Slider::DisplayBrightness(_)) {
                 1.0
             } else {
                 0.0
             },
             100.0,
-        ) as u32;
+        );
+        let v = percent.round() as u32;
+        self.animation_until.set(
+            self.animation_until
+                .get()
+                .max(Instant::now() + Duration::from_millis(100)),
+        );
         self.quiet = Instant::now() + Duration::from_millis(400);
         match target {
             Slider::Volume => {
-                self.common.audio = Some((f64::from(v), self.common.audio.is_some_and(|a| a.1)))
+                self.common.audio = Some((percent, self.common.audio.is_some_and(|a| a.1)))
             }
-            Slider::Brightness => self.common.brightness = Some(f64::from(v)),
-            Slider::DisplayBrightness(name) => {
-                if let Some(o) = self.display.outputs.iter_mut().find(|o| &o.name == name) {
-                    o.brightness = Some(f64::from(v));
-                    if matches!(o.control, Some(display::Brightness::Backlight(_))) {
-                        self.common.brightness = o.brightness;
-                    }
-                }
-            }
-            Slider::Temperature => {
-                self.display.settings.night.kelvin = display::MIN_KELVIN
-                    + ((f64::from(v) / 100.0 * f64::from(display::MAX_KELVIN - display::MIN_KELVIN)
-                        / 50.0)
-                        .round() as u32)
-                        * 50
-            }
+            Slider::Brightness => self.common.brightness = Some(percent),
+            Slider::DisplayBrightness(_) | Slider::Temperature => unreachable!(),
             Slider::Media(_, _) => unreachable!(),
             Slider::Audio(kind, id) => {
                 let collection = collection(kind);
@@ -1605,7 +1845,7 @@ impl Model {
                             if let Some(channels) = item["volume"].as_object_mut() {
                                 for channel in channels.values_mut() {
                                     channel["value"] =
-                                        ((f64::from(v) * 65536.0 / 100.0) as u64).into();
+                                        ((percent * 65536.0 / 100.0).round() as u64).into();
                                 }
                             }
                         }
@@ -1620,12 +1860,7 @@ impl Model {
         match target {
             Slider::Volume => self.write(control::Action::Volume(v)),
             Slider::Brightness => self.write(control::Action::Brightness(v)),
-            Slider::DisplayBrightness(name) => {
-                self.display_send(display::Request::Brightness(name.clone(), v))
-            }
-            Slider::Temperature => self.display_send(display::Request::Temperature(
-                self.display.settings.night.kelvin,
-            )),
+            Slider::DisplayBrightness(_) | Slider::Temperature => unreachable!(),
             Slider::Audio(kind, id) => self.audio_write(audio::volume_command(kind, *id, v)),
             Slider::Media(_, _) => unreachable!(),
         }
@@ -1700,15 +1935,20 @@ impl Model {
         self.notice_revision = self.notice_revision.wrapping_add(1);
     }
     pub fn audio_state(&mut self, mut next: Value) {
-        if Instant::now() < self.quiet {
+        if Instant::now() < self.quiet || self.dragging.is_some() {
             for collection in ["sinks", "sources", "sink-inputs", "source-outputs"] {
                 if let (Some(old), Some(new)) = (
                     self.audio[collection].as_array(),
                     next[collection].as_array_mut(),
                 ) {
                     for item in new {
-                        if let Some(prev) = old.iter().find(|p| p["index"] == item["index"]) {
-                            item["volume"] = prev["volume"].clone();
+                        let dragging = self.dragging.as_ref().is_some_and(|(_, target, _)| {
+                            matches!(target, Slider::Audio(kind, id) if self::collection(kind) == collection && item["index"].as_u64() == Some(*id))
+                        });
+                        if Instant::now() < self.quiet || dragging {
+                            if let Some(prev) = old.iter().find(|p| p["index"] == item["index"]) {
+                                item["volume"] = prev["volume"].clone();
+                            }
                         }
                     }
                 }
@@ -1719,13 +1959,14 @@ impl Model {
                 .as_array()
                 .and_then(|s| s.iter().find(|i| i["name"] == name))
             {
-                let percent = if Instant::now() < self.quiet {
-                    self.common
-                        .audio
-                        .map_or_else(|| audio::volume(item), |a| a.0)
-                } else {
-                    audio::volume(item)
-                };
+                let percent =
+                    if Instant::now() < self.quiet || self.dragging_slider(&Slider::Volume) {
+                        self.common
+                            .audio
+                            .map_or_else(|| audio::volume(item), |a| a.0)
+                    } else {
+                        audio::volume(item)
+                    };
                 self.common.audio = Some((percent, item["mute"].as_bool().unwrap_or(false)));
             }
         }
@@ -2185,6 +2426,341 @@ mod tests {
         });
         m.display_state(state);
         assert_eq!(m.display_menu, Some(display::Menu::Scale("eDP-1".into())));
+    }
+    #[test]
+    fn all_audio_and_brightness_sliders_keep_fractional_drag_samples_and_reject_stale_snapshots() {
+        for target in [
+            Slider::Volume,
+            Slider::Brightness,
+            Slider::Audio("sink".into(), 7),
+            Slider::Audio("source".into(), 7),
+            Slider::Audio("sink-input".into(), 7),
+            Slider::Audio("source-output".into(), 7),
+        ] {
+            let mut m = Model::new();
+            m.readonly = true;
+            m.common.audio = Some((20.0, false));
+            m.common.brightness = Some(20.0);
+            let device = serde_json::json!({"index":7,"name":"fixture","volume":{"front-left":{"value":13107},"front-right":{"value":13107}}});
+            m.audio = serde_json::json!({"info":{"default_sink_name":"fixture"},"sinks":[device.clone()],"sources":[device.clone()],"sink-inputs":[device.clone()],"source-outputs":[device]});
+            let stale_audio = m.audio.clone();
+            let (common_tx, common_rx) = mpsc::channel();
+            let (audio_tx, audio_rx) = mpsc::channel();
+            m.common_tx = Some(common_tx);
+            m.audio_tx = Some(audio_tx);
+            m.dragging = Some((
+                1,
+                target.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 100.0,
+                    w: 400.0,
+                    h: 38.0,
+                },
+            ));
+            for percent in [41.125, 41.375, 42.875] {
+                m.slider(&target, percent, true);
+                let current = match &target {
+                    Slider::Volume => m.common.audio.unwrap().0,
+                    Slider::Brightness => m.common.brightness.unwrap(),
+                    Slider::Audio(kind, _) => audio::volume(&m.audio[collection(kind)][0]),
+                    _ => unreachable!(),
+                };
+                assert!((m.slider_value(&target, current) - percent).abs() < 0.001);
+                m.quiet = Instant::now() - Duration::from_secs(10);
+                m.common_state(control::State {
+                    audio: Some((20.0, true)),
+                    brightness: Some(20.0),
+                    ..Default::default()
+                });
+                m.audio_state(stale_audio.clone());
+                let current = match &target {
+                    Slider::Volume => m.common.audio.unwrap().0,
+                    Slider::Brightness => m.common.brightness.unwrap(),
+                    Slider::Audio(kind, _) => audio::volume(&m.audio[collection(kind)][0]),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    (current - percent).abs() < 0.001,
+                    "stale snapshot overwrote {target:?}"
+                );
+            }
+            m.dragging = None;
+            m.common_state(control::State {
+                audio: Some((20.0, false)),
+                brightness: Some(20.0),
+                ..Default::default()
+            });
+            m.audio_state(stale_audio);
+            assert!(common_rx.try_recv().is_err());
+            assert!(audio_rx.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn all_control_gauge_motion_is_continuous_bounded_and_finishes_without_writes() {
+        for target in [
+            Slider::Volume,
+            Slider::Brightness,
+            Slider::Audio("sink".into(), 1),
+            Slider::Audio("source".into(), 2),
+            Slider::Audio("sink-input".into(), 3),
+            Slider::Audio("source-output".into(), 4),
+        ] {
+            let mut m = Model::new();
+            let key = format!("gauge:{target:?}");
+            assert_eq!(m.slider_value(&target, 20.0), 20.0);
+            assert_eq!(m.slider_value(&target, 60.0), 20.0);
+            m.icon_values.borrow_mut().get_mut(&key).unwrap().2 =
+                Instant::now() - Duration::from_millis(50);
+            let mid = m.slider_value(&target, 60.0);
+            assert!(mid > 40.0 && mid < 60.0);
+            assert!((m.slider_value(&target, 30.0) - mid).abs() < 0.1);
+            m.dragging = Some((
+                1,
+                target.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 100.0,
+                    w: 400.0,
+                    h: 38.0,
+                },
+            ));
+            assert_eq!(m.slider_value(&target, 41.125), 41.125);
+            m.dragging = None;
+            assert_eq!(m.slider_value(&target, 41.125), 41.125);
+            m.animation_until
+                .set(Instant::now() - Duration::from_secs(1));
+            for _ in 0..100 {
+                assert_eq!(m.slider_value(&target, 41.125), 41.125);
+                assert!(
+                    !m.animating(),
+                    "static {target:?} must not keep requesting frames"
+                );
+            }
+        }
+        let m = Model::new();
+        for key in [
+            "battery-charge",
+            "battery-health",
+            "osd-volume",
+            "osd-microphone",
+            "osd-brightness",
+            "osd-keyboard",
+        ] {
+            m.reset_readout(key, 20.0);
+            assert_eq!(m.readout_value(key, 20.0), 20.0);
+            assert_eq!(m.readout_value(key, 80.0), 20.0);
+            m.icon_values
+                .borrow_mut()
+                .get_mut(&format!("gauge:{key}"))
+                .unwrap()
+                .2 = Instant::now() - Duration::from_millis(200);
+            assert_eq!(m.readout_value(key, 80.0), 80.0);
+        }
+    }
+    fn display_slider_model() -> (Model, mpsc::Receiver<display::Request>) {
+        let mut m = Model::new();
+        m.page = Page::Display;
+        m.quiet = Instant::now() - Duration::from_secs(1);
+        let mode = serde_json::json!({"width":1920,"height":1080,"refresh_rate":60000});
+        m.display.outputs = display::parse_outputs(&serde_json::json!({
+            "eDP-1":{"make":"Test","model":"Panel","modes":[mode],"current_mode":0,"logical":{}},
+            "DP-1":{"make":"Test","model":"DDC","modes":[mode],"current_mode":0,"logical":{}},
+            "DP-2":{"make":"Test","model":"Unsupported","modes":[mode],"current_mode":0,"logical":{}}
+        }));
+        m.display.outputs[0].control = Some(display::Brightness::Backlight("test".into()));
+        m.display.outputs[1].control = Some(display::Brightness::Ddc(1, 100));
+        m.display.outputs[0].brightness = Some(20.0);
+        m.display.outputs[1].brightness = Some(30.0);
+        let (tx, rx) = mpsc::channel();
+        m.display_tx = Some(tx);
+        (m, rx)
+    }
+    #[test]
+    fn display_slider_drag_follows_fractional_input_and_flushes_the_latest_value() {
+        let (mut m, rx) = display_slider_model();
+        let target = Slider::DisplayBrightness("eDP-1".into());
+        let rect = Rect {
+            x: 32.0,
+            y: 140.0,
+            w: 408.0,
+            h: 36.0,
+        };
+        let mut old = m.display.clone();
+        m.dragging = Some((1, target.clone(), rect));
+        m.slider(&target, 41.125, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            display::Request::Brightness("eDP-1".into(), 41, 1)
+        );
+        m.display_last_write = Instant::now();
+        m.slider(&target, 41.375, false);
+        assert_eq!(m.display_gauge_value(&target, 0.0), 41.375);
+        assert!(rx.try_recv().is_err());
+        old.slider_serial = 1;
+        old.outputs[0].brightness = Some(41.0);
+        m.display_state(old.clone());
+        assert_eq!(m.display.outputs[0].brightness, Some(41.375));
+        m.slider(&target, 42.875, false);
+        assert_eq!(m.display.outputs[0].brightness, Some(42.875));
+        assert!(rx.try_recv().is_err());
+        m.display_state(old.clone());
+        assert_eq!(m.display.outputs[0].brightness, Some(42.875));
+        m.dragging = None;
+        m.common_state(control::State {
+            brightness: Some(41.0),
+            ..Default::default()
+        });
+        assert_eq!(m.display.outputs[0].brightness, Some(42.875));
+        m.slider(&target, 42.875, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            display::Request::Brightness("eDP-1".into(), 43, 2)
+        );
+        // An old completion arriving after release must not need a time window.
+        m.quiet = Instant::now() - Duration::from_secs(10);
+        m.display_state(old.clone());
+        assert_eq!(m.display.outputs[0].brightness, Some(42.875));
+        old.slider_serial = 2;
+        old.outputs[0].brightness = Some(43.0);
+        m.display_state(old);
+        assert_eq!(m.display.outputs[0].brightness, Some(43.0));
+        assert!(m.display_slider_drafts.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn display_slider_snapshots_acknowledge_each_latest_request_including_failures() {
+        let (mut m, rx) = display_slider_model();
+        let target = Slider::DisplayBrightness("DP-1".into());
+        let mut state = m.display.clone();
+        m.slider(&target, 50.0, true);
+        m.slider(&target, 75.0, true);
+        m.slider(&Slider::Temperature, 25.0, true);
+        assert_eq!(rx.try_iter().count(), 3);
+        state.slider_serial = 1;
+        state.outputs[1].brightness = Some(50.0);
+        state.outputs[0].brightness = Some(24.0);
+        state.error = "이전 요청 실패".into();
+        m.display_state(state.clone());
+        assert_eq!(m.display.outputs[1].brightness, Some(75.0));
+        assert_eq!(m.display.outputs[0].brightness, Some(24.0));
+        assert_eq!(m.display.settings.night.kelvin, 3500);
+        state.slider_serial = 2;
+        state.outputs[1].brightness = Some(75.0);
+        state.error.clear();
+        m.display_state(state.clone());
+        assert_eq!(m.display_slider_drafts.len(), 1);
+        assert_eq!(m.display.settings.night.kelvin, 3500);
+        state.slider_serial = 3;
+        state.settings.night.kelvin = 3500;
+        m.display_state(state.clone());
+        assert!(m.display_slider_drafts.is_empty());
+        m.slider(&target, 90.0, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            display::Request::Brightness("DP-1".into(), 90, 4)
+        );
+        state.slider_serial = 4;
+        state.error = "DDC 쓰기 실패".into();
+        m.display_state(state);
+        assert_eq!(m.display.outputs[1].brightness, Some(75.0));
+        assert_eq!(m.display.error, "DDC 쓰기 실패");
+        assert!(m.display_slider_drafts.is_empty());
+    }
+    #[test]
+    fn display_slider_drafts_do_not_follow_replaced_disconnected_or_unsupported_monitors() {
+        for change in [0, 1, 2] {
+            let (mut m, _rx) = display_slider_model();
+            let mut state = m.display.clone();
+            let target = Slider::DisplayBrightness("DP-1".into());
+            m.slider(&target, 80.0, true);
+            match change {
+                0 => state.outputs[1].identity = "replacement".into(),
+                1 => {
+                    state.outputs.remove(1);
+                }
+                _ => state.outputs[1].control = None,
+            }
+            let authoritative = state.outputs.clone();
+            m.display_state(state);
+            assert!(m.display_slider_drafts.is_empty());
+            assert_eq!(m.display.outputs, authoritative);
+        }
+    }
+    #[test]
+    fn display_slider_motion_retargets_continuously_settles_and_never_writes() {
+        let (mut m, rx) = display_slider_model();
+        let target = Slider::Temperature;
+        assert_eq!(m.display_gauge_value(&target, 50.0), 50.0);
+        m.slider(&target, 52.0, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            display::Request::Temperature(4600, 1)
+        );
+        assert_eq!(m.display_gauge_value(&target, 52.0), 50.0);
+        m.icon_values
+            .borrow_mut()
+            .get_mut("display-temperature")
+            .unwrap()
+            .2 = Instant::now() - Duration::from_millis(50);
+        let mid = m.display_gauge_value(&target, 52.0);
+        assert!(mid > 51.0 && mid < 52.0);
+        m.slider(&target, 30.0, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            display::Request::Temperature(3700, 2)
+        );
+        assert!((m.display_gauge_value(&target, 30.0) - mid).abs() < 0.05);
+        m.icon_values
+            .borrow_mut()
+            .get_mut("display-temperature")
+            .unwrap()
+            .2 = Instant::now() - Duration::from_millis(200);
+        m.animation_until
+            .set(Instant::now() - Duration::from_secs(1));
+        for _ in 0..30 {
+            assert_eq!(m.display_gauge_value(&target, 30.0), 30.0);
+            assert!(!m.animating());
+        }
+        assert!(rx.try_recv().is_err());
+        // Even inside one 50 K hardware step the pointer moves continuously.
+        m.dragging = Some((
+            1,
+            target.clone(),
+            Rect {
+                x: 32.0,
+                y: 140.0,
+                w: 408.0,
+                h: 36.0,
+            },
+        ));
+        for value in [50.1, 50.2, 50.3] {
+            m.slider(&target, value, false);
+            assert_eq!(m.display_gauge_value(&target, 0.0), value);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn display_slider_invalid_input_and_unsupported_controls_never_write() {
+        let (mut m, rx) = display_slider_model();
+        for target in [
+            Slider::Temperature,
+            Slider::DisplayBrightness("eDP-1".into()),
+        ] {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                m.slider(&target, value, true);
+            }
+        }
+        m.slider(&Slider::DisplayBrightness("DP-2".into()), 50.0, true);
+        assert_eq!(m.display.outputs[2].brightness, None);
+        assert!(m.display_slider_drafts.is_empty());
+        assert!(rx.try_recv().is_err());
+        m.readonly = true;
+        m.slider(&Slider::Temperature, 30.0, true);
+        m.slider(&Slider::DisplayBrightness("eDP-1".into()), 70.0, true);
+        assert_eq!(m.display.settings.night.kelvin, 3700);
+        assert_eq!(m.display.outputs[0].brightness, Some(70.0));
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn schedule_wheel_consumes_only_clock_fields_and_keeps_draft_through_old_snapshots() {

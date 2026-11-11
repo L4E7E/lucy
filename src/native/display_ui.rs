@@ -7,6 +7,25 @@ fn r(x: f64, y: f64, w: f64, h: f64) -> Rect {
     Rect { x, y, w, h }
 }
 
+fn temperature_gauge(cr: &Context, rect: Rect, value: f64) {
+    let _ = cr.save();
+    round(cr, rect, 18.0);
+    cr.clip();
+    cr.set_source_rgba(0.95, 0.96, 0.97, 0.13);
+    let _ = cr.paint();
+    let w = rect.w * value.clamp(0.0, 100.0) / 100.0;
+    if w > 0.0 {
+        // Anchor the spectrum to the full range, not the current fill width.
+        let gradient = cairo::LinearGradient::new(rect.x, rect.y, rect.x + rect.w, rect.y);
+        gradient.add_color_stop_rgb(0.0, 1.0, 0.55, 0.24);
+        gradient.add_color_stop_rgb(1.0, 1.0, 1.0, 1.0);
+        round(cr, Rect { w, ..rect }, 18.0);
+        let _ = cr.set_source(&gradient);
+        let _ = cr.fill();
+    }
+    let _ = cr.restore();
+}
+
 impl Paint<'_> {
     fn display_select(&mut self, rect: Rect, value: &str, menu: Menu, active: bool) {
         crystal(self.cr, rect, 11.0, self.display_hover(rect) || active);
@@ -84,33 +103,32 @@ impl Paint<'_> {
     }
     fn display_gauge(&mut self, y: f64, value: f64, label: &str, target: Slider, enabled: bool) {
         let rect = r(32.0, y, 408.0, 36.0);
-        gauge(self.cr, rect, if enabled { value } else { 0.0 });
+        let value = if enabled {
+            self.m.display_gauge_value(&target, value)
+        } else {
+            0.0
+        };
+        if matches!(target, Slider::Temperature) {
+            temperature_gauge(self.cr, rect, value);
+        } else {
+            gauge(self.cr, rect, value);
+        }
         let icon = r(42.0, y + 6.0, 24.0, 24.0);
-        gauge_icon(
-            self.cr,
-            rect,
-            icon,
-            if enabled { value } else { 0.0 },
-            |cr| brightness_icon(cr, icon, if enabled { value } else { 0.0 }),
-        );
-        gauge_icon(
-            self.cr,
-            rect,
-            r(325.0, y, 100.0, 36.0),
-            if enabled { value } else { 0.0 },
-            |cr| {
-                text(
-                    cr,
-                    &self.m.font,
-                    label,
-                    r(325.0, y, 100.0, 36.0),
-                    false,
-                    true,
-                    14.0,
-                    pango::Alignment::Right,
-                );
-            },
-        );
+        gauge_icon(self.cr, rect, icon, value, |cr| {
+            brightness_icon(cr, icon, value)
+        });
+        gauge_icon(self.cr, rect, r(325.0, y, 100.0, 36.0), value, |cr| {
+            text(
+                cr,
+                &self.m.font,
+                label,
+                r(325.0, y, 100.0, 36.0),
+                false,
+                true,
+                14.0,
+                pango::Alignment::Right,
+            );
+        });
         if enabled {
             self.hit(rect, Action::Slider(target), "")
         }
@@ -345,7 +363,9 @@ impl Paint<'_> {
         } else {
             choices.len() as f64 * 34.0 + 12.0
         };
-        let h = 194.0 + extra + if o.control.is_none() { 38.0 } else { 0.0 };
+        // Unsupported brightness draws the same disabled gauge, with no extra row.
+        let h = 194.0 + extra;
+        let bottom = y + h;
         crystal(self.cr, r(20.0, y, 432.0, h), 18.0, false);
         text(
             self.cr,
@@ -402,8 +422,9 @@ impl Paint<'_> {
             Slider::DisplayBrightness(o.name.clone()),
             o.control.is_some(),
         );
-        y += 36.0;
-        y + 18.0 + 12.0
+        // Include the entire card (also without brightness control) and its gap
+        // in the scroll extent so the last rim stays above the viewport edge.
+        bottom + 12.0
     }
     fn display_choices(&mut self, mut y: f64, choices: &[(String, Action, bool)]) -> f64 {
         for (title, action, selected) in choices {
@@ -648,6 +669,185 @@ pub fn identify(cr: &Context, m: &Model, index: usize) -> Scene {
 mod tests {
     use super::*;
     #[test]
+    fn bottom_scroll_preserves_last_card_rim_and_twelve_pixel_gap() {
+        for count in [1, 2, 3] {
+            for controls in 0..1 << count {
+                let name = outputs_model(count, controls).display.outputs[count - 1]
+                    .name
+                    .clone();
+                for menu in [
+                    None,
+                    Some(Menu::Resolution(name.clone())),
+                    Some(Menu::Rate(name.clone())),
+                    Some(Menu::Scale(name.clone())),
+                ] {
+                    let mut m = outputs_model(count, controls);
+                    m.display_menu = menu.clone();
+                    for height in [320, 400] {
+                        m.scroll = 0.0;
+                        let mut image =
+                            cairo::ImageSurface::create(cairo::Format::ARgb32, 480, height)
+                                .unwrap();
+                        {
+                            let cr = Context::new(&image).unwrap();
+                            let scene = popup(&cr, &m, 1, height);
+                            m.scroll = scene.content_height - scene.viewport_height;
+                            assert!(m.scroll > 0.0);
+                            cr.set_operator(cairo::Operator::Clear);
+                            let _ = cr.paint();
+                            cr.set_operator(cairo::Operator::Over);
+                            let mut p = Paint {
+                                cr: &cr,
+                                m: &m,
+                                id: 1,
+                                hits: vec![],
+                                clip: None,
+                            };
+                            let (content, viewport) = p.display_page(height);
+                            assert_eq!(content, scene.content_height);
+                            assert_eq!(viewport, scene.viewport_height);
+                        }
+                        image.flush();
+                        let stride = image.stride() as usize;
+                        let pixels = image.data().unwrap();
+                        let bottom = (height - 16) as usize;
+                        let last_ink = (TOP as usize..bottom)
+                            .rfind(|y| pixels[y * stride + 236 * 4 + 3] > 0)
+                            .unwrap();
+                        assert_eq!(
+                            bottom - last_ink - 1,
+                            12,
+                            "controls={controls:b}, menu={menu:?}, outputs={count}, height={height}"
+                        );
+                        for y in bottom - 12..bottom {
+                            assert!((20..452).all(|x| pixels[y * stride + x * 4 + 3] == 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn detail_cards_have_uniform_base_height_for_one_two_three_and_more_outputs() {
+        for count in [1, 2, 3, 4] {
+            for controls in 0..1 << count {
+                let mut m = outputs_model(count, controls);
+                let original = m.display.outputs.clone();
+                for (index, o) in original.iter().enumerate() {
+                    for (menu, extra) in [
+                        (None, 0.0),
+                        (Some(Menu::Resolution(o.name.clone())), 46.0),
+                        (Some(Menu::Rate(o.name.clone())), 46.0),
+                        (Some(Menu::Scale(o.name.clone())), 386.0),
+                    ] {
+                        m.display_menu = menu;
+                        let mut image =
+                            cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 620).unwrap();
+                        {
+                            let cr = Context::new(&image).unwrap();
+                            let mut p = Paint {
+                                cr: &cr,
+                                m: &m,
+                                id: 1,
+                                hits: vec![],
+                                clip: None,
+                            };
+                            let bottom = p.display_output(8.0, index, o);
+                            assert_eq!(bottom, 8.0 + 194.0 + extra + 12.0);
+                            let gauge = p.hits.iter().find(|hit| {
+                                matches!(&hit.action, Action::Slider(Slider::DisplayBrightness(name)) if name == &o.name)
+                            });
+                            assert_eq!(gauge.is_some(), o.control.is_some());
+                            if let Some(gauge) = gauge {
+                                assert_eq!(gauge.rect.y, 8.0 + 140.0 + extra);
+                                assert_eq!(bottom - 12.0 - gauge.rect.y - gauge.rect.h, 18.0);
+                            }
+                        }
+                        image.flush();
+                        let stride = image.stride() as usize;
+                        let data = image.data().unwrap();
+                        let ink: Vec<_> = (0..620)
+                            .filter(|y| data[y * stride + 236 * 4 + 3] > 0)
+                            .collect();
+                        assert_eq!(ink[0], 8);
+                        assert_eq!(*ink.last().unwrap(), (8.0 + 194.0 + extra) as usize - 1);
+                    }
+                }
+                assert_eq!(
+                    m.display.outputs, original,
+                    "drawing changed actual output settings"
+                );
+            }
+        }
+    }
+    #[test]
+    fn temperature_gradient_is_smooth_and_brightness_remains_neutral() {
+        let _glass = GlassScope::enter();
+        let render = |target, value, enabled| {
+            let m = model();
+            let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 52).unwrap();
+            let hits = {
+                let cr = Context::new(&image).unwrap();
+                let mut p = Paint {
+                    cr: &cr,
+                    m: &m,
+                    id: 1,
+                    hits: vec![],
+                    clip: None,
+                };
+                p.display_gauge(8.0, value, "", target, enabled);
+                p.hits
+            };
+            image.flush();
+            let pixels = image.data().unwrap().to_vec();
+            (pixels, hits)
+        };
+        let rgb = |pixels: &[u8], x: usize| {
+            let i = (26 * 480 + x) * 4;
+            let pixel = u32::from_ne_bytes(pixels[i..i + 4].try_into().unwrap());
+            [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255]
+        };
+        let (full, _) = render(Slider::Temperature, 100.0, true);
+        let warm = rgb(&full, 36);
+        let neutral = rgb(&full, 438);
+        assert!(warm[0] > warm[1] + 100 && warm[1] > warm[2] + 60);
+        assert!(neutral.iter().all(|v| *v >= 254));
+        for x in 76..318 {
+            let a = rgb(&full, x);
+            let b = rgb(&full, x + 1);
+            assert_eq!(a[0], 255);
+            for c in [1, 2] {
+                assert!(b[c] >= a[c] && b[c] - a[c] <= 1);
+            }
+        }
+        for value in [-10.0, 0.0, 1.0, 5.0, 25.0, 50.0, 100.0, 150.0] {
+            let (temperature, hits) = render(Slider::Temperature, value, true);
+            let (brightness, _) = render(Slider::DisplayBrightness("test".into()), value, true);
+            assert_eq!(hits.len(), 1);
+            assert!(matches!(
+                hits[0].action,
+                Action::Slider(Slider::Temperature)
+            ));
+            assert_eq!((hits[0].rect.x, hits[0].rect.w), (32.0, 408.0));
+            // Recoloring must leave fill extent, rounded caps and alpha unchanged.
+            for (a, b) in temperature.chunks_exact(4).zip(brightness.chunks_exact(4)) {
+                assert_eq!(a[3], b[3], "alpha changed at {value}%");
+            }
+            if value >= 25.0 {
+                assert_eq!(rgb(&temperature, 90), rgb(&full, 90));
+                assert_eq!(rgb(&brightness, 90), [255, 255, 255]);
+            }
+        }
+        let (disabled, hits) = render(Slider::Temperature, 80.0, false);
+        assert!(hits.is_empty());
+        assert_eq!(disabled, render(Slider::Temperature, 0.0, true).0);
+        for (percent, kelvin) in [(0.0, 2500), (50.0, 4500), (100.0, 6500)] {
+            let mut m = model();
+            m.slider(&Slider::Temperature, percent, true);
+            assert_eq!(m.display.settings.night.kelvin, kelvin);
+        }
+    }
+    #[test]
     fn scrolling_moves_monitor_cards_with_canvas_without_starting_layout_motion() {
         let mut m = model();
         let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 500).unwrap();
@@ -816,6 +1016,32 @@ mod tests {
             &serde_json::json!({"eDP-1":{"make":"BOE","model":"Test","modes":[mode],"current_mode":0,"logical":{"x":0,"y":0,"width":1706,"height":1066,"scale":1.5}}}),
         );
         m.gamma_supported = true;
+        m
+    }
+    fn outputs_model(count: usize, controls: usize) -> Model {
+        let mut m = model();
+        let internal = m.display.outputs[0].clone();
+        m.display.outputs = (0..count)
+            .map(|index| {
+                let mut o = internal.clone();
+                if index > 0 {
+                    o.name = format!("DP-{index}");
+                    o.identity = format!("external-test-{index}");
+                    o.x = 1706 * index as i32;
+                }
+                if controls & (1 << index) != 0 {
+                    o.control = Some(if index == 0 {
+                        display::Brightness::Backlight("test".into())
+                    } else {
+                        display::Brightness::Ddc(index as u32, 100)
+                    });
+                    o.brightness = Some(50.0);
+                } else {
+                    o.brightness_error = "밝기 제어 미지원".into();
+                }
+                o
+            })
+            .collect();
         m
     }
     #[test]

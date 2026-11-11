@@ -334,6 +334,8 @@ pub struct State {
     pub settings: Settings,
     pub pending: Option<Pending>,
     pub error: String,
+    /// Last slider request processed, including failures and coalesced requests.
+    pub slider_serial: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -343,10 +345,10 @@ pub enum Request {
     Place(Vec<Placement>),
     Keep,
     Revert,
-    Brightness(String, u32),
+    Brightness(String, u32, u64),
     Night(bool),
     Automatic(bool),
-    Temperature(u32),
+    Temperature(u32, u64),
     Time(bool, ClockPart, i32),
     Quit,
 }
@@ -799,8 +801,8 @@ fn keep(state: &mut State, path: &Path) -> Result<(), String> {
 }
 fn coalescible(a: &Request, b: &Request) -> bool {
     match (a, b) {
-        (Request::Brightness(a, _), Request::Brightness(b, _)) => a == b,
-        (Request::Temperature(_), Request::Temperature(_))
+        (Request::Brightness(a, _, _), Request::Brightness(b, _, _)) => a == b,
+        (Request::Temperature(_, _), Request::Temperature(_, _))
         | (Request::Refresh, Request::Refresh) => true,
         _ => false,
     }
@@ -981,7 +983,7 @@ impl Backend {
                                 refresh(&mut state);
                             }
                             Request::Keep => keep(&mut state, &path)?,
-                            Request::Brightness(ref name, percent) => {
+                            Request::Brightness(ref name, percent, _) => {
                                 let o = state
                                     .outputs
                                     .iter_mut()
@@ -1020,14 +1022,14 @@ impl Backend {
                             }
                             Request::Night(_)
                             | Request::Automatic(_)
-                            | Request::Temperature(_)
+                            | Request::Temperature(_, _)
                             | Request::Time(_, _, _) => {
                                 let mut settings = state.settings.clone();
                                 let n = &mut settings.night;
                                 match request {
                                     Request::Night(v) => n.enabled = v,
                                     Request::Automatic(v) => n.automatic = v,
-                                    Request::Temperature(v) => {
+                                    Request::Temperature(v, _) => {
                                         n.kelvin = v.clamp(MIN_KELVIN, MAX_KELVIN)
                                     }
                                     Request::Time(start, part, steps) => {
@@ -1046,6 +1048,11 @@ impl Backend {
                         state.error = e
                     } else if request != Request::Refresh {
                         state.error.clear();
+                    }
+                    if let Request::Brightness(_, _, serial) | Request::Temperature(_, serial) =
+                        request
+                    {
+                        state.slider_serial = serial;
                     }
                     let _ = events.send(state.clone());
                     if quit {
@@ -1330,22 +1337,52 @@ mod tests {
     fn slider_coalescing_preserves_keep_and_quit_order() {
         let (tx, rx) = mpsc::channel();
         for r in [
-            Request::Temperature(3500),
-            Request::Temperature(4000),
+            Request::Temperature(3500, 2),
+            Request::Temperature(4000, 3),
             Request::Keep,
-            Request::Temperature(5000),
+            Request::Temperature(5000, 4),
             Request::Quit,
         ] {
             tx.send(r).unwrap();
         }
         let mut queue = VecDeque::new();
         assert_eq!(
-            latest(Request::Temperature(3000), &rx, &mut queue),
-            Request::Temperature(4000)
+            latest(Request::Temperature(3000, 1), &rx, &mut queue),
+            Request::Temperature(4000, 3)
         );
         assert_eq!(queue.pop_front(), Some(Request::Keep));
-        assert_eq!(rx.recv().unwrap(), Request::Temperature(5000));
+        assert_eq!(rx.recv().unwrap(), Request::Temperature(5000, 4));
         assert_eq!(rx.recv().unwrap(), Request::Quit);
+    }
+    #[test]
+    fn brightness_coalescing_keeps_latest_serial_without_crossing_outputs_or_temperature() {
+        let (tx, rx) = mpsc::channel();
+        for r in [
+            Request::Brightness("DP-1".into(), 40, 2),
+            Request::Brightness("DP-1".into(), 50, 3),
+            Request::Brightness("DP-2".into(), 60, 4),
+            Request::Brightness("DP-1".into(), 70, 5),
+            Request::Temperature(3500, 6),
+            Request::Quit,
+        ] {
+            tx.send(r).unwrap();
+        }
+        let mut queue = VecDeque::new();
+        assert_eq!(
+            latest(Request::Brightness("DP-1".into(), 30, 1), &rx, &mut queue),
+            Request::Brightness("DP-1".into(), 50, 3)
+        );
+        for expected in [
+            Request::Brightness("DP-2".into(), 60, 4),
+            Request::Brightness("DP-1".into(), 70, 5),
+            Request::Temperature(3500, 6),
+            Request::Quit,
+        ] {
+            let next = queue.pop_front().unwrap();
+            assert_eq!(latest(next, &rx, &mut queue), expected);
+        }
+        assert!(queue.is_empty());
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn schedules_include_midnight_without_inverting_daytime() {

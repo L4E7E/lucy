@@ -44,6 +44,38 @@ fn source_label(m: &Model) -> &'static str {
 }
 
 impl Paint<'_> {
+    fn power_source_labels(&self, y: f64) {
+        text(
+            self.cr,
+            &self.m.font,
+            source_label(self.m),
+            Rect {
+                x: 264.0,
+                y: y + 38.0,
+                w: 180.0,
+                h: 28.0,
+            },
+            false,
+            true,
+            16.0,
+            pango::Alignment::Left,
+        );
+        text_ink(
+            self.cr,
+            &self.m.font,
+            &consumption(self.m),
+            Rect {
+                x: 264.0,
+                y: y + 66.0,
+                w: 180.0,
+                h: 24.0,
+            },
+            false,
+            14.0,
+            pango::Alignment::Left,
+            (0.72, 0.75, 0.79),
+        );
+    }
     fn power_profiles(&mut self, r: Rect, selected: Option<&str>, automatic: Option<bool>) {
         crystal(self.cr, r, 14.0, false);
         let width = (r.w - 8.0) / 3.0;
@@ -422,39 +454,9 @@ impl Paint<'_> {
                 w: 412.0,
                 h: 6.0,
             },
-            m.icon_value("battery-charge", charge),
+            m.readout_value("battery-charge", charge),
         );
-        let title = source_label(m);
-        text(
-            self.cr,
-            &m.font,
-            title,
-            Rect {
-                x: 264.0,
-                y: y + 38.0,
-                w: 180.0,
-                h: 28.0,
-            },
-            false,
-            true,
-            14.0,
-            pango::Alignment::Left,
-        );
-        text_ink(
-            self.cr,
-            &m.font,
-            &consumption(m),
-            Rect {
-                x: 264.0,
-                y: y + 66.0,
-                w: 180.0,
-                h: 24.0,
-            },
-            false,
-            12.0,
-            pango::Alignment::Left,
-            (0.72, 0.75, 0.79),
-        );
+        self.power_source_labels(y);
         y += HERO_HEIGHT + 12.0;
         crystal(
             self.cr,
@@ -479,7 +481,7 @@ impl Paint<'_> {
             true,
         );
         let health = m.power.battery.as_ref().and_then(|b| b.health);
-        let value = m.icon_value("battery-health", health.unwrap_or(0.0));
+        let value = m.readout_value("battery-health", health.unwrap_or(0.0));
         let r = Rect {
             x: 34.0,
             y: y + 42.0,
@@ -827,6 +829,78 @@ impl Paint<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enlarged_source_and_consumption_labels_fit_separate_hero_rows() {
+        use super::*;
+        let mut m = model();
+        m.readonly = true;
+        for source in [Some(false), Some(true), None] {
+            m.power.on_battery = source;
+            for watts in [None, Some(9.5), Some(123.4)] {
+                m.power.battery.as_mut().unwrap().state = 2;
+                m.power.battery.as_mut().unwrap().watts = watts;
+                let mut image =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, WIDTH, HERO_HEIGHT as i32)
+                        .unwrap();
+                {
+                    let cr = Context::new(&image).unwrap();
+                    let p = Paint {
+                        cr: &cr,
+                        m: &m,
+                        id: 1,
+                        hits: vec![],
+                        clip: None,
+                    };
+                    p.power_source_labels(0.0);
+                }
+                image.flush();
+                let stride = image.stride() as usize;
+                let pixels = image.data().unwrap();
+                let mut bounds = [(444, 66, 264, 38), (444, 90, 264, 66)];
+                for y in 0..HERO_HEIGHT as usize {
+                    for x in 0..WIDTH as usize {
+                        if pixels[y * stride + x * 4 + 3] == 0 {
+                            continue;
+                        }
+                        assert!((264..444).contains(&x) && (38..90).contains(&y));
+                        let row = usize::from(y >= 66);
+                        let b = &mut bounds[row];
+                        b.0 = b.0.min(x);
+                        b.1 = b.1.min(y);
+                        b.2 = b.2.max(x);
+                        b.3 = b.3.max(y);
+                    }
+                }
+                assert!(bounds[0].2 > bounds[0].0 && bounds[1].2 > bounds[1].0);
+                assert!(
+                    bounds[0].3 + 4 < bounds[1].1,
+                    "labels must have a clear gap"
+                );
+                assert!(bounds[1].3 + 16 < 116, "keep clear of the charge gauge");
+                for (title, old_size, bold, b) in [
+                    (source_label(&m).to_owned(), 14.0, true, bounds[0]),
+                    (consumption(&m), 12.0, false, bounds[1]),
+                ] {
+                    let surface =
+                        cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 40).unwrap();
+                    let cr = Context::new(&surface).unwrap();
+                    let layout = super::super::super::text_cache::create(&cr);
+                    let mut font = pango::FontDescription::from_string(&m.font);
+                    font.set_absolute_size(old_size * f64::from(pango::SCALE));
+                    if bold {
+                        font.set_weight(pango::Weight::Semibold);
+                    }
+                    layout.set_font_description(Some(&font));
+                    layout.set_text(&title);
+                    let (old_ink, _) = layout.pixel_extents();
+                    assert!(
+                        b.2 - b.0 + 1 > old_ink.width() as usize,
+                        "{title} must grow"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn battery_hero_only_describes_the_power_source_not_charge_wait_states() {
         use super::*;

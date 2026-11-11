@@ -6,8 +6,12 @@ use std::{
 
 pub const CLOCK_SCALE: f32 = 3.0;
 pub const CALENDAR_CLOCK_SIZE: f64 = 58.0;
-// Give the enlarged clock a little top breathing room without moving the calendar.
-pub const CALENDAR_CLOCK_Y: f32 = 0.0;
+// The inset lives inside the cached clock/date canvas, not on its surface.
+pub const CALENDAR_CLOCK_Y: f32 = 8.0;
+pub const CALENDAR_CLOCK_WIDTH: f32 = 280.0;
+pub const CALENDAR_DATE_Y: f32 = 86.0;
+pub const CALENDAR_DATE_HEIGHT: f32 = 28.0;
+pub const CALENDAR_WIDGET_HEIGHT: f32 = CALENDAR_DATE_Y + CALENDAR_DATE_HEIGHT;
 pub const PANEL_OPEN_MS: u64 = 360;
 pub const NOTICE_OPEN_MS: u64 = 480;
 pub const OSD_OPEN_MS: u64 = 450;
@@ -43,6 +47,7 @@ pub struct Frame {
     pub size: (i32, i32),
     pub header: (f32, f32),
     pub header_scale: f32,
+    pub header_height: f32,
     pub amount: f32,
     pub time: f32,
 }
@@ -51,7 +56,10 @@ pub fn layout(amount: f32, source: f32, target: (i32, i32), header: f32, calenda
     let w = (source + (target.0 as f32 - source) * p).round().max(1.0) as i32;
     let h = (34.0 + (target.1 as f32 - 34.0) * p).round().max(1.0) as i32;
     let scale = if calendar {
-        1.0 + (CLOCK_SCALE - 1.0) * p
+        // The collapsed date bar and expanded clock/date share one canvas.
+        // Starting from the HH:MM raster's width makes it detach from the bar.
+        let start = source / header.max(1.0);
+        start + (CLOCK_SCALE - start) * p
     } else {
         1.0
     };
@@ -62,9 +70,14 @@ pub fn layout(amount: f32, source: f32, target: (i32, i32), header: f32, calenda
         size: (w, h),
         header: (
             origin + (destination - origin) * p - header * scale * 0.5,
-            if calendar { CALENDAR_CLOCK_Y * p } else { 0.0 },
+            0.0,
         ),
         header_scale: scale,
+        header_height: if calendar {
+            34.0 + (CALENDAR_WIDGET_HEIGHT - 34.0) * p
+        } else {
+            34.0
+        },
         amount: p,
         time: 1.0,
     }
@@ -206,6 +219,55 @@ impl Expansion {
 mod tests {
     use super::*;
     #[test]
+    fn calendar_canvas_follows_the_surface_from_the_full_date_bar() {
+        // Different date widths must not change the logical target, or make
+        // HH:MM supply the collapsed surface width.
+        for source in [154.0, 221.0, 308.0] {
+            let header = (CALENDAR_CLOCK_WIDTH / CLOCK_SCALE).ceil();
+            let first = layout(0.0, source, (780, 500), header, true);
+            assert!(first.header.0.abs() < 0.001);
+            assert_eq!(first.header.1, 0.0);
+            assert_eq!(first.header_height, 34.0);
+            assert!((header * first.header_scale - source).abs() < 0.001);
+            let last = layout(1.0, source, (780, 500), header, true);
+            assert_eq!(last.header_height, CALENDAR_WIDGET_HEIGHT);
+            assert_eq!(last.header.0 + header * last.header_scale * 0.5, 160.0);
+            for step in 0..=100 {
+                let p = step as f32 / 100.0;
+                let f = layout(p, source, (780, 500), header, true);
+                let center = f.header.0 + header * f.header_scale * 0.5;
+                assert!((center - f.size.0 as f32 * 0.5 + 230.0 * p).abs() < 0.001);
+                assert!(
+                    (f.header_height - (34.0 + (CALENDAR_WIDGET_HEIGHT - 34.0) * p)).abs() < 0.001
+                );
+                assert!(f.header_height <= f.size.1 as f32);
+            }
+        }
+    }
+    #[test]
+    fn calendar_reversal_preserves_the_whole_clock_date_canvas() {
+        let header = (CALENDAR_CLOCK_WIDTH / CLOCK_SCALE).ceil();
+        for t in [0.05, 0.25, 0.55, 0.85, 1.0] {
+            let mut e = Expansion::new(221, (780, 500), true, true);
+            e.presented(t);
+            let visible = e.frame_at(t, header);
+            e.close(header);
+            let closing = e.frame_at(0.0, header);
+            assert_eq!(closing.size, visible.size);
+            assert_eq!(closing.header, visible.header);
+            assert_eq!(closing.header_scale, visible.header_scale);
+            assert_eq!(closing.header_height, visible.header_height);
+            e.presented(0.3);
+            let visible = e.frame_at(0.3, header);
+            e.reopen(header);
+            let reopened = e.frame_at(0.0, header);
+            assert_eq!(reopened.size, visible.size);
+            assert_eq!(reopened.header, visible.header);
+            assert_eq!(reopened.header_scale, visible.header_scale);
+            assert_eq!(reopened.header_height, visible.header_height);
+        }
+    }
+    #[test]
     fn closing_during_open_starts_at_the_last_presented_frame() {
         let mut e = Expansion::new(180, (780, 500), true, true);
         e.presented(0.3);
@@ -331,7 +393,7 @@ mod tests {
             assert_eq!(a.size, (source as i32, 34));
             assert_eq!(a.header, (0.0, 0.0));
             assert_eq!(b.size, target);
-            assert_eq!(b.header.1, if calendar { CALENDAR_CLOCK_Y } else { 0.0 });
+            assert_eq!(b.header.1, 0.0);
             let center = b.header.0 + source * b.header_scale / 2.0;
             assert_eq!(b.header_scale, if calendar { CLOCK_SCALE } else { 1.0 });
             assert_eq!(

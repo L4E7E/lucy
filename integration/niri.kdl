@@ -30,6 +30,7 @@ gestures {
 // Niri 26.04 has a cross-GPU non-xray blur bug; use a build containing the
 // upstream Smithay fix. See https://github.com/niri-wm/niri/pull/4395.
 // The modal session scrim covers all outputs with one shared pixel.
+// It is translucent: non-xray compositor blur includes the live windows below.
 layer-rule {
     match namespace="^lucy-session-backdrop$"
     geometry-corner-radius 0

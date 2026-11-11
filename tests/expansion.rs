@@ -111,7 +111,7 @@ fn bar_surface_expands_and_returns_without_replacement() {
         assert!(
             bars.iter()
                 .any(|b| b["side"] == side && b["surface"] == source),
-            "must borrow an original surface on the chosen output"
+            "must borrow an original surface on the chosen output: opened={opened}, bars={bars:?}"
         );
         assert!(opened["borrowed_from"].is_number());
         assert_eq!(opened["size"][1], 500, "cycle {cycle}: {opened}");
@@ -129,7 +129,9 @@ fn bar_surface_expands_and_returns_without_replacement() {
             let name = bars.iter().find(|b| b["surface"] == source).unwrap()["output"]
                 .as_str()
                 .unwrap();
-            let p = pointer.get_or_insert_with(|| pointer::Pointer::new(name));
+            // IPC opens follow the focused output, which can change between
+            // cycles; do not keep a pointer bound to another monitor.
+            let p = pointer.insert(pointer::Pointer::new(name));
             if page == "home" {
                 let x = p.width - 8.0 - opened["size"][0].as_f64().unwrap()
                     + (opened["size"][0].as_f64().unwrap() - 480.0) / 2.0;
@@ -198,18 +200,20 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 );
             } else {
                 let x = (p.width - opened["size"][0].as_f64().unwrap()) / 2.0;
-                p.click(x + 38.0, 139.0);
+                // Calendar navigation moved below the clock/date widget:
+                // output margin 6 + button y (64 + 78) + half-height 15.
+                p.click(x + 38.0, 163.0);
                 let clicked = status();
                 assert_eq!(
                     clicked["visible"], true,
                     "calendar click must not hit the backdrop"
                 );
                 assert_eq!(clicked["calendar_offset"], -1);
-                p.click(x + 282.0, 139.0);
+                p.click(x + 282.0, 163.0);
                 assert_eq!(status()["calendar_offset"], 0);
-                p.wheel(x + 166.0, 200.0, 15.0);
+                p.wheel(x + 166.0, 240.0, 15.0);
                 assert_eq!(status()["calendar_offset"], 1);
-                p.wheel(x + 166.0, 200.0, -15.0);
+                p.wheel(x + 166.0, 240.0, -15.0);
                 assert_eq!(status()["calendar_offset"], 0);
             }
             println!("cycle {cycle}: {page} body controls respond to persistent pointer input");
@@ -459,7 +463,9 @@ fn bar_surface_expands_and_returns_without_replacement() {
                 let leaving = status();
                 assert_eq!(leaving["surface"], opened["surface"]);
                 assert_eq!(leaving["animation"], "SlideBack");
-                assert_eq!(leaving["gpu_gauges"], 0);
+                // Home may retain one media progress gauge when a player is
+                // present; only the monitor's telemetry gauges must disappear.
+                assert!(leaving["gpu_gauges"].as_u64().unwrap() <= 1);
                 assert_eq!(leaving["monitor"]["active"], false);
                 thread::sleep(Duration::from_millis(300));
                 socket.send_to(b"system", &server).unwrap();
@@ -512,12 +518,14 @@ fn bar_surface_expands_and_returns_without_replacement() {
         thread::sleep(Duration::from_millis(350));
         assert!(status()["borrowed_from"].is_null());
     }
-    if let Some(p) = pointer.as_mut() {
+    if input {
         for header in [true, false] {
             socket.send_to(b"calendar", &server).unwrap();
             thread::sleep(Duration::from_millis(560));
+            let opened = status();
+            let mut p = pointer::Pointer::new(opened["output"].as_str().unwrap());
             if header {
-                let x = (p.width - status()["size"][0].as_f64().unwrap()) / 2.0;
+                let x = (p.width - opened["size"][0].as_f64().unwrap()) / 2.0;
                 p.click(x + 166.0, 28.0);
             } else {
                 p.click(20.0, 55.0);
@@ -668,7 +676,15 @@ fn bar_surface_expands_and_returns_without_replacement() {
         assert_eq!(after["animating"], false);
         println!("liquid indicator: {frames} compositor-paced frames");
         if input {
-            let p = pointer.as_mut().unwrap();
+            let output = state["bars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|bar| bar["surface"] == after["surface"])
+                .unwrap()["output"]
+                .as_str()
+                .unwrap();
+            let p = pointer.insert(pointer::Pointer::new(output));
             // Preview workspaces are fictitious: input is real, Niri focus is not changed.
             p.wheel(66.0, 23.0, 15.0);
             assert_eq!(status()["workspace_scroll_target"], 90001);

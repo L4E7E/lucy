@@ -120,6 +120,8 @@ def run(binary, seconds, expected_output):
             if "allocator" in after:
                 row.update({"heap_in_use_mib": round(after["allocator"]["in_use"] / 1048576, 1),
                             "heap_free_mib": round(after["allocator"]["free"] / 1048576, 1)})
+            if "memory_reclaim" in after:
+                row["memory_reclaim"] = after["memory_reclaim"]
             print(json.dumps(row, ensure_ascii=False), flush=True)
 
         time.sleep(2)

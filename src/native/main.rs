@@ -35,6 +35,7 @@ mod notification_server;
 mod notifications;
 mod osd;
 mod power;
+mod resources;
 mod scroll;
 mod text_cache;
 mod tray;

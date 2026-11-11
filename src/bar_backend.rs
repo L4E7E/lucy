@@ -36,13 +36,23 @@ fn niri_request(path: &Path, request: Value) -> std::io::Result<Value> {
     socket.set_write_timeout(Some(Duration::from_millis(500)))?;
     writeln!(socket, "{request}")?;
     let mut reply = String::new();
-    BufReader::new(socket).take(65536).read_line(&mut reply)?;
+    BufReader::new(socket)
+        .take(4 * 1024 * 1024)
+        .read_line(&mut reply)?;
     let reply: Value = serde_json::from_str(&reply).map_err(std::io::Error::other)?;
     if let Some(response) = reply.get("Ok") {
         Ok(response.clone())
     } else {
         Err(std::io::Error::other(reply.to_string()))
     }
+}
+
+fn niri_outputs(path: &Path) -> Option<Value> {
+    niri_request(path, "Outputs".into())
+        .ok()?
+        .get("Outputs")
+        .filter(|v| v.is_object())
+        .cloned()
 }
 
 fn focus_workspace_at(path: &Path, id: u64, skip_if_active: bool) -> std::io::Result<()> {
@@ -461,8 +471,8 @@ pub(crate) fn workers(tx: glib::Sender<Update>) -> Workers {
         let mut previous = None;
         let mut outputs = Value::Null;
         while !stopping.load(Ordering::Acquire) {
-            if let Some(next) = output("niri", &["msg", "-j", "outputs"])
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            if let Some(next) =
+                env::var_os("NIRI_SOCKET").and_then(|path| niri_outputs(Path::new(&path)))
             {
                 if next != outputs {
                     outputs = next;
@@ -567,6 +577,25 @@ pub(crate) fn update_spaces(spaces: &mut Vec<Value>, event: &Value) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_queries_use_bounded_ipc_and_preserve_large_multi_monitor_replies() {
+        let root = env::temp_dir().join(format!("lucy-output-query-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("niri.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let expected = serde_json::json!({"eDP-1":{"name":"eDP-1","modes":"x".repeat(80_000)}});
+        let reply = expected.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&socket).read_line(&mut request).unwrap();
+            assert_eq!(request.trim(), "\"Outputs\"");
+            writeln!(socket, "{}", serde_json::json!({"Ok":{"Outputs":reply}})).unwrap();
+        });
+        assert_eq!(niri_outputs(&path), Some(expected));
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn workspace_focus_sends_the_stable_id_not_the_cli_index() {
         let root = std::env::temp_dir().join(format!(

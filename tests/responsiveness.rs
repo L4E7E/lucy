@@ -135,4 +135,17 @@ fn idle_reopen_advances_without_unrelated_input() {
     assert_eq!(launcher["size"], serde_json::json!([600, 486]));
     assert_eq!(launcher["launcher_focus"], false);
     println!("launcher: five columns, three full rows and half of the fourth");
+    let reclaims = launcher["memory_reclaim"]["runs"].as_u64().unwrap();
+    socket.send_to(b"@hide", &server).unwrap();
+    thread::sleep(Duration::from_millis(1900));
+    let idle = status();
+    assert_eq!(idle["visible"], false);
+    let after_idle = idle["memory_reclaim"]["runs"].as_u64().unwrap();
+    assert!(after_idle <= reclaims + 1, "idle cleanup must be one-shot");
+    socket.send_to(b"home", &server).unwrap();
+    thread::sleep(Duration::from_millis(1700));
+    let reopened = status();
+    assert_eq!(reopened["size"], serde_json::json!([480, 500]));
+    assert_eq!(reopened["memory_reclaim"]["runs"], after_idle);
+    println!("idle memory maintenance stays paused while the UI is open");
 }

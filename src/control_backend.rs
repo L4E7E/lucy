@@ -258,8 +258,58 @@ pub(crate) enum Request {
     Quit,
 }
 pub(crate) enum Event {
-    State(Box<State>),
+    State(Box<State>, Vec<Domain>),
     Done(Domain, bool),
+}
+#[cfg(test)]
+mod gauge_write_tests {
+    use super::*;
+    #[test]
+    fn absolute_gauge_bursts_keep_latest_and_preserve_barriers() {
+        let result = coalesce_writes(vec![
+            Request::Write(Action::Volume(10)),
+            Request::Write(Action::Volume(20)),
+            Request::Write(Action::Mute),
+            Request::Write(Action::Volume(30)),
+            Request::Write(Action::Brightness(40)),
+            Request::Write(Action::Brightness(50)),
+            Request::Refresh(Domain::Brightness),
+            Request::Write(Action::Brightness(60)),
+            Request::Quit,
+        ]);
+        assert_eq!(result.len(), 7);
+        assert!(matches!(result[0], Request::Write(Action::Volume(20))));
+        assert!(matches!(result[1], Request::Write(Action::Mute)));
+        assert!(matches!(result[2], Request::Write(Action::Volume(30))));
+        assert!(matches!(result[3], Request::Write(Action::Brightness(50))));
+        assert!(matches!(result[4], Request::Refresh(Domain::Brightness)));
+        assert!(matches!(result[5], Request::Write(Action::Brightness(60))));
+        assert!(matches!(result[6], Request::Quit));
+    }
+}
+fn coalesce_writes(requests: Vec<Request>) -> Vec<Request> {
+    if requests.len() < 2 {
+        return requests;
+    }
+    let mut out = Vec::with_capacity(requests.len());
+    for request in requests {
+        let replace = matches!(
+            (out.last(), &request),
+            (
+                Some(Request::Write(Action::Volume(_))),
+                Request::Write(Action::Volume(_))
+            ) | (
+                Some(Request::Write(Action::Brightness(_))),
+                Request::Write(Action::Brightness(_))
+            )
+        );
+        if replace {
+            *out.last_mut().unwrap() = request;
+        } else {
+            out.push(request);
+        }
+    }
+    out
 }
 
 pub(crate) const MEDIA_FORMAT: &str =
@@ -400,7 +450,7 @@ impl Backend {
                 let mut media_position = false;
                 let mut completed = Vec::new();
                 let mut quit = false;
-                for request in batch {
+                for request in coalesce_writes(batch) {
                     match request {
                         Request::Quit => {
                             quit = true;
@@ -430,7 +480,13 @@ impl Backend {
                     completed.push((Domain::Media, false));
                 }
                 if !domains.is_empty() || media_position {
-                    let _ = events.send(Event::State(Box::new(state.clone())));
+                    let refreshed = DOMAINS
+                        .into_iter()
+                        .filter(|domain| {
+                            domains.contains(domain) || (media_position && *domain == Domain::Media)
+                        })
+                        .collect();
+                    let _ = events.send(Event::State(Box::new(state.clone()), refreshed));
                 }
                 for (domain, success) in completed {
                     let _ = events.send(Event::Done(domain, success));

@@ -1,5 +1,5 @@
-//! Outside-click surfaces share one pixel. Session backdrops instead carry a
-//! small, pre-blurred snapshot, independent of compositor multi-GPU effects.
+//! Outside-click surfaces share one pixel. The session scrim is translucent;
+//! Niri blurs the live windows beneath it rather than a captured wallpaper.
 use std::{
     collections::HashMap,
     fs::File,
@@ -33,31 +33,18 @@ pub struct Backdrop {
     wake: UnixStream,
     worker: Option<thread::JoinHandle<()>>,
 }
-pub struct Artwork {
-    pub pixels: Vec<u8>,
-    pub width: i32,
-    pub height: i32,
-    pub stride: i32,
-}
-type Capture = fn(&str) -> Option<Artwork>;
+const SESSION_PIXEL: [u8; 4] = [5, 4, 4, 76];
 impl Backdrop {
     pub fn new(namespace: &str, clicked: glib::Sender<()>) -> Result<Self, String> {
-        Self::with_pixel(namespace, clicked, [0; 4], None)
+        Self::with_pixel(namespace, clicked, [0; 4])
     }
-    pub fn session(clicked: glib::Sender<()>, capture: Capture) -> Result<Self, String> {
-        // Opaque fallback rather than an unreadable, unblurred desktop on failure.
-        Self::with_pixel(
-            "lucy-session-backdrop",
-            clicked,
-            [17, 14, 14, 255],
-            Some(capture),
-        )
+    pub fn session(clicked: glib::Sender<()>) -> Result<Self, String> {
+        Self::with_pixel("lucy-session-backdrop", clicked, SESSION_PIXEL)
     }
     fn with_pixel(
         namespace: &str,
         clicked: glib::Sender<()>,
         pixel: [u8; 4],
-        capture: Option<Capture>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -78,35 +65,13 @@ impl Backdrop {
                     shell: None,
                     viewporter: None,
                     buffer: None,
-                    artwork: HashMap::new(),
                     outputs: HashMap::new(),
-                    output_names: HashMap::new(),
                     surfaces: HashMap::new(),
                     initialized: false,
                 };
                 queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-                // wl_output.name arrives after binding the registry globals.
+                // Settle the output globals before creating fullscreen catchers.
                 queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-                // Capture every output before mapping any scrim. Return only byte
-                // vectors across threads; Cairo objects remain thread-local.
-                if let Some(capture) = capture {
-                    state.artwork = thread::scope(|scope| {
-                        let jobs: Vec<_> = state
-                            .output_names
-                            .iter()
-                            .map(|(&id, name)| (id, scope.spawn(move || capture(name))))
-                            .collect();
-                        jobs.into_iter()
-                            .filter_map(|(id, job)| {
-                                let art = job.join().ok().flatten();
-                                if art.is_none() {
-                                    eprintln!("Lucy session: background capture failed for output {id}; using opaque fallback");
-                                }
-                                art.map(|art| (id, art))
-                            })
-                            .collect()
-                    });
-                }
                 if state.compositor.is_none()
                     || state.shm.is_none()
                     || state.shell.is_none()
@@ -207,16 +172,12 @@ struct Surface {
     surface: wl_surface::WlSurface,
     layer: layer::ZwlrLayerSurfaceV1,
     viewport: wp_viewport::WpViewport,
-    buffer: Option<wl_buffer::WlBuffer>,
 }
 impl Drop for Surface {
     fn drop(&mut self) {
         self.layer.destroy();
         self.viewport.destroy();
         self.surface.destroy();
-        if let Some(buffer) = &self.buffer {
-            buffer.destroy();
-        }
     }
 }
 struct State {
@@ -227,9 +188,7 @@ struct State {
     shell: Option<shell::ZwlrLayerShellV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
     buffer: Option<wl_buffer::WlBuffer>,
-    artwork: HashMap<u32, Artwork>,
     outputs: HashMap<u32, wl_output::WlOutput>,
-    output_names: HashMap<u32, String>,
     surfaces: HashMap<u32, Surface>,
     initialized: bool,
 }
@@ -239,32 +198,6 @@ impl State {
             return;
         }
         let surface = self.compositor.as_ref().unwrap().create_surface(qh, ());
-        let buffer = self.artwork.remove(&id).and_then(|art| {
-            let fd =
-                unsafe { libc::memfd_create(c"lucy-session-blur".as_ptr(), libc::MFD_CLOEXEC) };
-            if fd < 0 {
-                return None;
-            }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(&art.pixels).ok()?;
-            let pool = self.shm.as_ref()?.create_pool(
-                file.as_fd(),
-                art.pixels.len().try_into().ok()?,
-                qh,
-                (),
-            );
-            let buffer = pool.create_buffer(
-                0,
-                art.width,
-                art.height,
-                art.stride,
-                wl_shm::Format::Argb8888,
-                qh,
-                (),
-            );
-            pool.destroy();
-            Some(buffer)
-        });
         let viewport = self
             .viewporter
             .as_ref()
@@ -301,7 +234,6 @@ impl State {
                 surface,
                 layer,
                 viewport,
-                buffer,
             },
         );
     }
@@ -342,7 +274,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             },
             wl_registry::Event::GlobalRemove { name } => {
                 state.surfaces.remove(&name);
-                state.output_names.remove(&name);
                 if let Some(output) = state.outputs.remove(&name) {
                     if wayland_client::Proxy::version(&output) >= 3 {
                         output.release();
@@ -360,7 +291,7 @@ impl Dispatch<layer::ZwlrLayerSurfaceV1, u32> for State {
         event: layer::Event,
         id: &u32,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
     ) {
         match event {
             layer::Event::Configure {
@@ -373,15 +304,7 @@ impl Dispatch<layer::ZwlrLayerSurfaceV1, u32> for State {
                     surface
                         .viewport
                         .set_destination(width.max(1) as i32, height.max(1) as i32);
-                    if state.namespace == "lucy-session-backdrop" {
-                        let region = state.compositor.as_ref().unwrap().create_region(qh, ());
-                        region.add(0, 0, width.max(1) as i32, height.max(1) as i32);
-                        surface.surface.set_opaque_region(Some(&region));
-                        region.destroy();
-                    }
-                    surface
-                        .surface
-                        .attach(surface.buffer.as_ref().or(state.buffer.as_ref()), 0, 0);
+                    surface.surface.attach(state.buffer.as_ref(), 0, 0);
                     surface.surface.damage(0, 0, i32::MAX, i32::MAX);
                     surface.surface.commit();
                 }
@@ -445,8 +368,7 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            state.output_names.insert(*id, name);
+        if let wl_output::Event::Name { .. } = event {
             state.add_surface(*id, qh);
         }
     }
@@ -454,3 +376,23 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
 delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore shell::ZwlrLayerShellV1);
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn session_scrim_is_premultiplied_and_leaves_live_windows_visible() {
+        let [blue, green, red, alpha] = super::SESSION_PIXEL;
+        assert!((1..255).contains(&alpha));
+        assert!(blue <= alpha && green <= alpha && red <= alpha);
+        let integration = include_str!("../integration/niri.kdl");
+        let rule = integration
+            .split("match namespace=\"^lucy-session-backdrop$\"")
+            .nth(1)
+            .unwrap()
+            .split("layer-rule")
+            .next()
+            .unwrap();
+        assert!(rule.contains("blur true"));
+        assert!(rule.contains("xray false"));
+    }
+}

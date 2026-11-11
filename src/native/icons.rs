@@ -186,7 +186,7 @@ pub fn status(cr: &Context, r: Rect, key: &str, state: &str) {
                 "memory" => (0.50, 0.79, 1.0),
                 "disk" => (1.0, 0.65, 0.75),
                 "audio" => (0.60, 0.82, 1.0),
-                "network" => (0.40, 0.72, 1.0),
+                "network" | "wired" | "ethernet" => (0.40, 0.72, 1.0),
                 "bluetooth" => (0.66, 0.56, 1.0),
                 "power" => (1.0, 0.72, 0.40),
                 "notification" => (0.55, 0.76, 1.0),
@@ -224,6 +224,12 @@ pub fn status_colored(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, 
     status_rgba(cr, r, key, state, (ink.0, ink.1, ink.2, 1.0));
 }
 pub fn status_rgba(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, f64, f64, f64)) {
+    // The bar keeps a single Network action; choose the jack for its wired state.
+    let key = if key == "network" && state.contains('󰈀') {
+        "ethernet"
+    } else {
+        key
+    };
     let _ = cr.save();
     let size =
         r.w.min(r.h)
@@ -367,6 +373,25 @@ pub fn status_rgba(cr: &Context, r: Rect, key: &str, state: &str, ink: (f64, f64
                     cr.new_sub_path();
                     cr.arc(11.0, 12.0, radius, -0.65, 0.65);
                 }
+            }
+        }
+        "wired" | "ethernet" => {
+            // Minimal jack silhouette with four contact pairs, no faceplate.
+            cr.move_to(4.5, 5.5);
+            cr.line_to(19.5, 5.5);
+            cr.line_to(19.5, 13.5);
+            cr.line_to(15.5, 13.5);
+            cr.line_to(15.5, 18.5);
+            cr.line_to(8.5, 18.5);
+            cr.line_to(8.5, 13.5);
+            cr.line_to(4.5, 13.5);
+            cr.close_path();
+            let _ = cr.stroke();
+            cr.set_line_width(1.2);
+            for i in 0..4 {
+                let x = 7.0 + f64::from(i) * 10.0 / 3.0;
+                cr.move_to(x, 8.0);
+                cr.line_to(x, 10.5);
             }
         }
         "network" => {
@@ -633,6 +658,70 @@ pub fn sound_waves(state: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wired_and_ethernet_aliases_draw_a_centered_rj45_socket() {
+        let render = |key, state, alpha| {
+            let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 256, 256).unwrap();
+            {
+                let cr = Context::new(&image).unwrap();
+                // Inspect contact geometry above the native antialiasing scale.
+                cr.scale(8.0, 8.0);
+                status_rgba(
+                    &cr,
+                    Rect {
+                        x: 4.0,
+                        y: 4.0,
+                        w: 24.0,
+                        h: 24.0,
+                    },
+                    key,
+                    state,
+                    (1.0, 1.0, 1.0, alpha),
+                );
+            }
+            image.flush();
+            let pixels = image.data().unwrap().to_vec();
+            pixels
+        };
+        let wired = render("wired", "", 1.0);
+        assert_eq!(wired, render("ethernet", "", 1.0));
+        assert_eq!(wired, render("network", "󰈀", 1.0));
+        assert_ne!(wired, render("network", "", 1.0));
+        let alpha = |x: usize, y: usize| wired[(y * 256 + x) * 4 + 3];
+        let mut bounds = (256, 256, 0, 0);
+        for y in 0..256 {
+            for x in 0..256 {
+                if alpha(x, y) > 0 {
+                    assert!((32..224).contains(&x) && (32..224).contains(&y));
+                    bounds.0 = bounds.0.min(x);
+                    bounds.1 = bounds.1.min(y);
+                    bounds.2 = bounds.2.max(x);
+                    bounds.3 = bounds.3.max(y);
+                }
+            }
+        }
+        assert!((bounds.0 + bounds.2).abs_diff(255) <= 1);
+        assert!((bounds.1 + bounds.3).abs_diff(255) <= 1);
+        // Four clean contact-pair marks keep the small bar icon readable.
+        let mut contacts = 0;
+        let mut previous = false;
+        for x in 92..166 {
+            let ink = alpha(x, 112) > 120;
+            contacts += usize::from(ink && !previous);
+            previous = ink;
+        }
+        assert_eq!(contacts, 4);
+        // Lower central latch recess, with an open interior on either side.
+        assert!(alpha(107, 160) > 100 && alpha(149, 160) > 100);
+        assert_eq!(alpha(88, 164), 0);
+        assert_eq!(alpha(168, 164), 0);
+        // No square faceplate outside the jack itself.
+        assert_eq!(alpha(74, 160), 0);
+        assert_eq!(alpha(182, 160), 0);
+        let dim = render("wired", "", 0.4);
+        assert!(dim.chunks_exact(4).all(|p| p[3] <= 102));
+        assert_eq!(render("ethernet", "", 0.0), vec![0; wired.len()]);
+    }
     #[test]
     fn refresh_matches_loading_ring_ink_size_and_stays_centered() {
         use super::*;

@@ -1,6 +1,6 @@
 //! Opt-in Niri input regression helper. One persistent virtual pointer, no tools
 //! or system configuration changes; dropping the connection removes the device.
-use std::{collections::HashMap, process::Command, thread, time::Duration};
+use std::{cell::Cell, collections::HashMap, process::Command, thread, time::Duration};
 use wayland_client::{
     delegate_noop,
     protocol::{
@@ -66,6 +66,7 @@ delegate_noop!(State: manager::ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: pointer::ZwlrVirtualPointerV1);
 
 pub struct Pointer {
+    last_time: Cell<u32>,
     connection: Connection,
     queue: EventQueue<State>,
     state: State,
@@ -101,6 +102,7 @@ impl Pointer {
         let outputs: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
         let logical = &outputs[name]["logical"];
         Self {
+            last_time: Cell::new(0),
             connection,
             queue,
             state,
@@ -109,9 +111,28 @@ impl Pointer {
             height: logical["height"].as_f64().unwrap(),
         }
     }
+    fn timestamp(&self) -> u32 {
+        let mut clock = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) },
+            0
+        );
+        let now = (clock.tv_sec as u64 * 1000 + clock.tv_nsec as u64 / 1_000_000) as u32;
+        let last = self.last_time.get();
+        let next = if now.wrapping_sub(last) as i32 > 0 || last == 0 {
+            now
+        } else {
+            last.wrapping_add(1)
+        };
+        self.last_time.set(next);
+        next
+    }
     pub fn click(&mut self, x: f64, y: f64) {
         self.device.motion_absolute(
-            1,
+            self.timestamp(),
             x.round() as u32,
             y.round() as u32,
             self.width as u32,
@@ -119,10 +140,12 @@ impl Pointer {
         );
         // Motion and press belong to one pointer frame: a physical pointer must
         // not move between the test's target placement and button press.
-        self.device.button(2, 0x110, ButtonState::Pressed);
+        self.device
+            .button(self.timestamp(), 0x110, ButtonState::Pressed);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();
-        self.device.button(3, 0x110, ButtonState::Released);
+        self.device
+            .button(self.timestamp(), 0x110, ButtonState::Released);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();
         self.connection.flush().unwrap();
@@ -130,13 +153,14 @@ impl Pointer {
     }
     pub fn wheel(&mut self, x: f64, y: f64, value: f64) {
         self.device.motion_absolute(
-            4,
+            self.timestamp(),
             x.round() as u32,
             y.round() as u32,
             self.width as u32,
             self.height as u32,
         );
-        self.device.axis(5, Axis::VerticalScroll, value);
+        self.device
+            .axis(self.timestamp(), Axis::VerticalScroll, value);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -148,19 +172,20 @@ impl Pointer {
     #[allow(dead_code)]
     pub fn drag_with_preview(&mut self, x: f64, y: f64, dx: f64, dy: f64, preview: impl FnOnce()) {
         self.device.motion_absolute(
-            1,
+            self.timestamp(),
             x.round() as u32,
             y.round() as u32,
             self.width as u32,
             self.height as u32,
         );
-        self.device.button(2, 0x110, ButtonState::Pressed);
+        self.device
+            .button(self.timestamp(), 0x110, ButtonState::Pressed);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();
         thread::sleep(Duration::from_millis(80));
         for i in 1..=8 {
             self.device.motion_absolute(
-                3,
+                self.timestamp(),
                 (x + dx * f64::from(i) / 8.0).round() as u32,
                 (y + dy * f64::from(i) / 8.0).round() as u32,
                 self.width as u32,
@@ -174,13 +199,14 @@ impl Pointer {
         // A screenshot/inspection may take long enough for another input device
         // to move. Make the tested drop coordinate and release one pointer frame.
         self.device.motion_absolute(
-            4,
+            self.timestamp(),
             (x + dx).round() as u32,
             (y + dy).round() as u32,
             self.width as u32,
             self.height as u32,
         );
-        self.device.button(4, 0x110, ButtonState::Released);
+        self.device
+            .button(self.timestamp(), 0x110, ButtonState::Released);
         self.device.frame();
         self.queue.roundtrip(&mut self.state).unwrap();
         thread::sleep(Duration::from_millis(250));

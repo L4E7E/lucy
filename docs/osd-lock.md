@@ -4,7 +4,9 @@
 
 알림은 가운데 시계 바의 기존 `wl_surface`에서 카드로 확장된다. 펼친 알림에는
 시계나 내부 카드 테두리가 없다. OSD는 같은 표면을 사용하되 높이 34px를 유지하고
-좌우로만 확장한다. 모든 OSD 아이콘은 흰색이다. 알림 표시 중 OSD가 들어오면
+좌우로만 확장한다. 모든 OSD 아이콘은 흰색이다. 게이지 값은 100ms 보간하며,
+연속 입력은 현재 표시 위치에서 이어진다. 새 OSD나 종류 변경 시 이전 값은
+이어받지 않는다. 변화가 끝나면 추가 프레임 요청을 멈춘다. 알림 표시 중 OSD가 들어오면
 잠시 OSD를 표시한 뒤 아직 유효한 알림으로 돌아간다.
 제어센터·알림센터 확장은 360ms, 알림 팝업 확장은 기존 480ms의 단조 감쇠 곡선을 사용한다. 세부 화면 전환은 300ms로, 진입할 때 왼쪽으로 밀리고 뒤로 갈 때 오른쪽으로 밀린다. 화면끼리 투명도를 섞지 않으며 글래스 배경과 상태바는 고정한다. 초반에 최종 크기로 튀어 올라 멈추는 곡선은 사용하지 않는다. OSD·스크롤·트레이의 기존 애니메이션 시간은 유지한다.
 너비는 기본 시계 바보다 60px 넓게(최소 236px), 값 글씨는 16px로 표시한다. 키보드 백라이트는 퍼센트 대신 `꺼짐 / 1단계 / 2단계 / 3단계`처럼 장치의 실제 단계로 표시한다.
@@ -53,6 +55,15 @@ ASUS Fn+F5 전원 모드 OSD는 `/sys/firmware/acpi/platform_profile` 커널 알
 
 커널 경로 참고: [ASUS WMI 키 처리](https://github.com/torvalds/linux/blob/master/drivers/platform/x86/asus-wmi.c), [LED 하드웨어 알림](https://github.com/torvalds/linux/blob/master/drivers/leds/led-class.c), [전원 프로필 알림](https://github.com/torvalds/linux/blob/master/drivers/acpi/platform_profile.c).
 Niri 키 설정 예시는 `integration/niri.kdl`에 있다.
+
+## 세션 메뉴 배경
+
+종료·재부팅·잠금 등 다섯 버튼을 표시하는 세션 메뉴는 반투명 한 픽셀을
+출력별 화면 크기로 확장한다. `lucy-session-backdrop`에 `blur true`,
+`xray false`를 적용하여 배경화면뿐 아니라 실제 열린 창까지 Niri가 블러
+처리한다. 이 메뉴에서는 화면 캡처·CPU 블러·출력별 이미지 버퍼를 만들지
+않는다. 수정된 다중 GPU 블러를 포함하는 Niri가 필요하다.
+아래의 보안 잠금 화면은 별도 경로이며, 불투명 표면과 인증 절차를 유지한다.
 
 ## 실제 세션 잠금
 

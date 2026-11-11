@@ -268,6 +268,73 @@ pub(crate) enum Event {
     State(Value),
     Error(String),
 }
+#[cfg(test)]
+mod gauge_write_tests {
+    use super::*;
+    #[test]
+    fn mixer_gauges_coalesce_per_device_without_reordering_mute_or_relative_commands() {
+        let result = coalesce_writes(vec![
+            Request::Write(volume_command("sink", 1, 10)),
+            Request::Write(volume_command("sink", 1, 20)),
+            Request::Write(volume_command("source", 1, 30)),
+            Request::Write(volume_command("source", 1, 40)),
+            Request::Write(vec!["set-source-mute".into(), "1".into(), "toggle".into()]),
+            Request::Write(volume_command("sink", 2, 50)),
+            Request::Refresh,
+            Request::Write(volume_command("sink", 2, 60)),
+            Request::Write(vec!["set-sink-volume".into(), "2".into(), "+5%".into()]),
+            Request::Write(volume_command("sink", 2, 70)),
+            Request::Quit,
+        ]);
+        assert_eq!(result.len(), 9);
+        for (index, kind, id, percent) in [
+            (0, "sink", 1, 20),
+            (1, "source", 1, 40),
+            (3, "sink", 2, 50),
+            (5, "sink", 2, 60),
+            (7, "sink", 2, 70),
+        ] {
+            let Request::Write(args) = &result[index] else {
+                panic!("lost volume write")
+            };
+            assert_eq!(*args, volume_command(kind, id, percent));
+        }
+        assert!(matches!(&result[2], Request::Write(args) if args[0]=="set-source-mute"));
+        assert!(matches!(result[4], Request::Refresh));
+        assert!(matches!(&result[6], Request::Write(args) if args[2]=="+5%"));
+        assert!(matches!(result[8], Request::Quit));
+    }
+}
+fn coalesce_writes(requests: Vec<Request>) -> Vec<Request> {
+    if requests.len() < 2 {
+        return requests;
+    }
+    let absolute_volume = |args: &[String]| {
+        args.len() == 3
+            && args[0]
+                .strip_prefix("set-")
+                .and_then(|s| s.strip_suffix("-volume"))
+                .is_some_and(|name| KINDS.iter().any(|(kind, _, _)| *kind == name))
+            && args[2]
+                .strip_suffix('%')
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut out = Vec::with_capacity(requests.len());
+    for request in requests {
+        let replace = match (out.last(), &request) {
+            (Some(Request::Write(old)), Request::Write(new)) => {
+                absolute_volume(old) && absolute_volume(new) && old[..2] == new[..2]
+            }
+            _ => false,
+        };
+        if replace {
+            *out.last_mut().unwrap() = request;
+        } else {
+            out.push(request);
+        }
+    }
+    out
+}
 pub(crate) struct Backend {
     pub(crate) tx: mpsc::Sender<Request>,
     pub(crate) stop: Arc<AtomicBool>,
@@ -293,7 +360,7 @@ impl Backend {
                 let mut requests = vec![first];
                 requests.extend(rx.try_iter());
                 let mut refresh = false;
-                for request in requests {
+                for request in coalesce_writes(requests) {
                     if worker_stop.load(Ordering::Acquire) {
                         return;
                     }

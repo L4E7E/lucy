@@ -57,8 +57,86 @@ impl Drop for Preview {
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
+fn verify_control_gauges(
+    socket: &UnixDatagram,
+    server: &PathBuf,
+    status: &impl Fn() -> serde_json::Value,
+) {
+    // All control gauges: real Wayland drag/wheel input in the read-only preview.
+    // The model keeps fractional pointer positions; no mixer/backlight writes.
+    socket.send_to(b"home", server).unwrap();
+    thread::sleep(Duration::from_millis(550));
+    let opened = status();
+    let mut p = pointer::Pointer::new(opened["output"].as_str().unwrap());
+    for target in [
+        "Volume",
+        "Brightness",
+        "Audio(\"sink\", 7)",
+        "Audio(\"source\", 8)",
+        "Audio(\"sink-input\", 9)",
+        "Audio(\"source-output\", 10)",
+    ] {
+        if target == "Audio(\"sink\", 7)" {
+            socket.send_to(b"@preview-audio", &server).unwrap();
+            thread::sleep(Duration::from_millis(400));
+        }
+        let x = p.width - 8.0 - status()["size"][0].as_f64().unwrap();
+        let find = |s: &serde_json::Value| {
+            s["gauge_controls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["target"] == target && c["rect"][3].as_f64().unwrap() >= 30.0)
+                .cloned()
+        };
+        let mut gauge = None;
+        for _ in 0..24 {
+            if let Some(c) = find(&status()) {
+                gauge = Some(c);
+                break;
+            }
+            p.wheel(x + 466.0, 340.0, 25.0);
+        }
+        let gauge = gauge.unwrap_or_else(|| panic!("missing gauge {target}: {}", status()));
+        let r = std::array::from_fn::<_, 4, _>(|i| gauge["rect"][i].as_f64().unwrap());
+        p.drag_with_preview(
+            x + r[0] + r[2] * 0.31,
+            6.0 + r[1] + r[3] * 0.5,
+            r[2] * (0.71125 - 0.31),
+            0.0,
+            || {
+                let moving = status();
+                let current = find(&moving).unwrap()["value"].as_f64().unwrap();
+                assert!(
+                    (current - 71.125).abs() < 1.0,
+                    "{target} drag position: {current}; pointer={}, window={}, rect={r:?}, output={}", moving["pointer_xy"], moving["pointer_window"], moving["output"]
+                );
+                assert!(
+                    (current - current.round()).abs() > 0.01,
+                    "{target} pointer was quantized: {current}"
+                );
+            },
+        );
+        let before = status();
+        let previous = find(&before).unwrap()["value"].as_f64().unwrap();
+        p.wheel(x + r[0] + r[2] * 0.6, 6.0 + r[1] + r[3] * 0.5, 15.0);
+        let after = status();
+        let current = find(&after).unwrap()["value"].as_f64().unwrap();
+        assert!(
+            (current - previous + 2.0).abs() < 0.01,
+            "{target} wheel: {previous} -> {current}"
+        );
+        assert!(
+            after["presented"].as_u64().unwrap() > before["presented"].as_u64().unwrap() + 2,
+            "{target} wheel did not present animation frames"
+        );
+    }
+    socket.send_to(b"@hide", &server).unwrap();
+    thread::sleep(Duration::from_millis(450));
+    println!("PASS: fractional drag and animated wheel input for all six audio/brightness gauges; no hardware writes");
+}
 #[test]
-#[ignore = "opens a read-only Lucy display preview; run inside a Niri session"]
+#[ignore = "opens a read-only Lucy display preview; requires an unlocked Niri session"]
 fn display_identification_scale_layout_and_night_controls_are_readonly() {
     let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
@@ -111,6 +189,10 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
         thread::sleep(Duration::from_millis(30));
     };
 
+    if std::env::var_os("LUCY_TEST_GAUGES_ONLY").is_some() {
+        verify_control_gauges(&socket, &server, &status);
+        return;
+    }
     let hardware = Command::new("niri")
         .args(["msg", "-j", "outputs"])
         .output()
@@ -391,6 +473,8 @@ fn display_identification_scale_layout_and_night_controls_are_readonly() {
         false,
         "hidden media must not poll or repaint"
     );
+    verify_control_gauges(&socket, &server, &status);
     println!("PASS: live output list, temporary identify overlay, scale dropdown, scroll, dual display drag/reset, independent hour/minute wheel controls; no hardware writes");
     println!("PASS: native media progress, microsecond seeking, visible-only refresh timer; no player writes");
+    println!("PASS: fractional drag and animated wheel input for volume, brightness, output, microphone, per-app playback/recording; no hardware writes");
 }

@@ -40,12 +40,12 @@ const CONTROL_TILE_HEIGHT: f64 = 100.0;
 pub const SESSION_WIDTH: i32 = 760;
 pub const SESSION_HEIGHT: i32 = 176;
 pub const WIFI_ROW_PITCH: f64 = 68.0;
-pub const CALENDAR_SHIFT: f64 = 54.0;
+pub const CALENDAR_SHIFT: f64 = 78.0;
 const CALENDAR_DATE: Rect = Rect {
     x: 20.0,
-    y: 78.0,
+    y: super::expansion::CALENDAR_DATE_Y as f64,
     w: 280.0,
-    h: 28.0,
+    h: super::expansion::CALENDAR_DATE_HEIGHT as f64,
 };
 pub const CALENDAR_GRID: Rect = Rect {
     x: 20.0,
@@ -63,7 +63,7 @@ thread_local! {
     static JOINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DRAW_OFFSET: std::cell::Cell<(f64,f64)> = const { std::cell::Cell::new((0.0,0.0)) };
     static HIT_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static GPU_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GPU_BAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 struct OffsetScope((f64, f64));
 impl OffsetScope {
@@ -201,6 +201,14 @@ fn bar_rim(cr: &Context, r: Rect, left: bool) {
     let _ = cr.set_source(&rim);
     cr.set_line_width(1.0);
     let _ = cr.stroke();
+}
+// The software fallback uses the same bar material at every expanded size.
+fn bar_material(cr: &Context, r: Rect, left: bool) {
+    round(cr, r, PANEL_RADIUS);
+    cr.set_source_rgba(25.0 / 255.0, 27.0 / 255.0, 34.0 / 255.0, 0.54);
+    let _ = cr.fill();
+    crystal_exact(cr, r, PANEL_RADIUS, false);
+    bar_rim(cr, r, left);
 }
 fn stack_tail_height(progress: f64, rows: usize) -> f64 {
     if rows > 1 {
@@ -717,7 +725,7 @@ impl Paint<'_> {
             if self.m.tab == "vpn" {
                 "vpn"
             } else {
-                "network"
+                "ethernet"
             },
             "",
             if active { (0.55, 0.80, 1.0) } else { WHITE },
@@ -1228,6 +1236,8 @@ impl Paint<'_> {
         self.hit(r, a, tip);
     }
     fn slider(&mut self, y: f64, w: f64, v: f64, target: Slider, mic: bool, muted: bool) {
+        let label = format!("{v:.0}%");
+        let v = self.m.slider_value(&target, v);
         let r = Rect {
             x: 20.0,
             y,
@@ -1249,10 +1259,9 @@ impl Paint<'_> {
         }
         gauge_icon(self.cr, r, icon, v, |cr| {
             if target == Slider::Brightness {
-                brightness_icon(cr, icon, self.m.icon_value("brightness", v));
+                brightness_icon(cr, icon, v);
             } else {
-                let key = format!("{target:?}");
-                audio_icon(cr, icon, mic, muted, self.m.icon_value(&key, v));
+                audio_icon(cr, icon, mic, muted, v);
             }
         });
         if target != Slider::Brightness {
@@ -1270,21 +1279,24 @@ impl Paint<'_> {
                 },
             );
         }
-        text_ink(
-            self.cr,
-            &self.m.font,
-            &format!("{v:.0}%"),
-            Rect {
-                x: r.x + r.w - 61.0,
-                y,
-                w: 49.0,
-                h: 38.0,
-            },
-            false,
-            0.0,
-            pango::Alignment::Right,
-            if v >= 94.0 { (0.20, 0.22, 0.26) } else { WHITE },
-        );
+        let label_rect = Rect {
+            x: r.x + r.w - 61.0,
+            y,
+            w: 49.0,
+            h: 38.0,
+        };
+        gauge_icon(self.cr, r, label_rect, v, |cr| {
+            text_ink(
+                cr,
+                &self.m.font,
+                &label,
+                label_rect,
+                false,
+                0.0,
+                pango::Alignment::Right,
+                WHITE,
+            );
+        });
     }
     fn secret(&mut self, y: f64) {
         let _private = super::text_cache::Private::enter();
@@ -1679,6 +1691,13 @@ fn notification_header(card: Rect, stamp_width: f64, active: bool) -> (Rect, Rec
     )
 }
 
+fn notification_button_ink(key: &str, dnd: bool) -> (f64, f64, f64) {
+    if key == "notification" && dnd {
+        (1.0, 0.45, 0.50)
+    } else {
+        (0.95, 0.96, 0.97)
+    }
+}
 fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
     let cr = p.cr;
     let _smooth = super::text_cache::SmoothText::enter(cr);
@@ -1723,7 +1742,7 @@ fn notification_list(p: &mut Paint<'_>, height: i32) -> (f64, f64) {
             r,
             key,
             if m.notifications.dnd { "󰂛" } else { "" },
-            (0.95, 0.96, 0.97),
+            notification_button_ink(key, m.notifications.dnd),
         );
         p.hit(r, action, "");
     }
@@ -2018,6 +2037,11 @@ pub fn osd_ink(cr: &Context, m: &Model, width: f64, height: f64) {
     let Some(state) = &m.osd else {
         return;
     };
+    let value = if state.kind == super::osd::Kind::Profile {
+        state.value
+    } else {
+        m.readout_value(&format!("osd-{}", state.kind.name()), state.value)
+    };
     let icon = Rect {
         x: 14.0,
         y: (height - 24.0) / 2.0,
@@ -2030,9 +2054,9 @@ pub fn osd_ink(cr: &Context, m: &Model, width: f64, height: f64) {
             icon,
             state.kind == super::osd::Kind::Microphone,
             state.muted,
-            state.value,
+            value,
         ),
-        super::osd::Kind::Brightness => brightness_icon(cr, icon, state.value),
+        super::osd::Kind::Brightness => brightness_icon(cr, icon, value),
         super::osd::Kind::Keyboard => {
             super::icons::status_colored(cr, icon, "keyboard-backlight", "", WHITE)
         }
@@ -2073,7 +2097,7 @@ pub fn osd_ink(cr: &Context, m: &Model, width: f64, height: f64) {
         let _ = cr.save();
         round(cr, r, 3.0);
         cr.clip();
-        cr.rectangle(r.x, r.y, r.w * state.value.clamp(0.0, 100.0) / 100.0, r.h);
+        cr.rectangle(r.x, r.y, r.w * value / 100.0, r.h);
         color(cr, WHITE, if state.muted { 0.45 } else { 1.0 });
         let _ = cr.fill();
         let _ = cr.restore();
@@ -2836,22 +2860,16 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             w: progress.w,
             h: 4.0,
         };
-        round(cr, track, 2.0);
-        color(cr, WHITE, 0.17);
-        let _ = cr.fill();
-        let ratio = m.media_progress().clamp(0.0, 100.0) / 100.0;
-        if ratio > 0.0 {
-            round(
-                cr,
-                Rect {
-                    w: track.w * ratio,
-                    ..track
-                },
-                2.0,
-            );
-            color(cr, WHITE, 0.95);
-            let _ = cr.fill();
-        }
+        p.data_gauge(
+            track,
+            &m.common.media.as_ref().map_or_else(
+                || "media-progress:none".into(),
+                |media| format!("media-progress:{}:{}", media.player, media.track),
+            ),
+            m.common.media.as_ref().map(|_| m.media_progress()),
+            "",
+            "",
+        );
         text(
             cr,
             &m.font,
@@ -2943,7 +2961,7 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
             );
         }
     } else {
-        if !matches!(m.page, Page::Calendar | Page::TrayMenu) {
+        if !matches!(m.page, Page::Calendar | Page::TrayMenu | Page::System) {
             p.button(
                 Rect {
                     x: 20.0,
@@ -2973,7 +2991,11 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 _ => "",
             },
             Rect {
-                x: if m.page == Page::Calendar { 20.0 } else { 70.0 },
+                x: if matches!(m.page, Page::Calendar | Page::System) {
+                    20.0
+                } else {
+                    70.0
+                },
                 y: 18.0,
                 w: if m.page == Page::Calendar {
                     280.0
@@ -3646,39 +3668,10 @@ pub fn popup(cr: &Context, m: &Model, id: u32, height: i32) -> Scene {
                 p.clip = None;
             }
             Page::Calendar => {
-                let widget = Rect {
-                    x: 20.0,
-                    y: f64::from(super::expansion::CALENDAR_CLOCK_Y),
-                    w: 280.0,
-                    h: 34.0 * f64::from(super::expansion::CLOCK_SCALE),
-                };
-                if !JOINED.with(|v| v.get()) {
-                    let mut font = pango::FontDescription::from_string(&m.font);
-                    font.set_weight(pango::Weight::Medium);
-                    font.set_absolute_size(
-                        super::expansion::CALENDAR_CLOCK_SIZE * f64::from(pango::SCALE),
-                    );
-                    super::header_ui::clock(
-                        cr,
-                        &font.to_string(),
-                        &glib::DateTime::now_local()
-                            .unwrap()
-                            .format("%H:%M")
-                            .unwrap(),
-                        widget,
-                    );
-                }
                 let now = glib::DateTime::now_local().unwrap();
-                text(
-                    cr,
-                    &m.font,
-                    &calendar_date(&now),
-                    CALENDAR_DATE,
-                    false,
-                    false,
-                    18.0,
-                    pango::Alignment::Center,
-                );
+                if !JOINED.with(|v| v.get()) {
+                    calendar_clock_widget(cr, m, &now);
+                }
                 let total = now.year() * 12 + now.month() - 1 + m.calendar_offset;
                 let year = total.div_euclid(12);
                 let month = total.rem_euclid(12) + 1;
@@ -3909,7 +3902,7 @@ pub fn glass_expanded_fallback(
     output: &str,
     width: i32,
 ) -> Scene {
-    glass_base(
+    bar_material(
         cr,
         Rect {
             x: 0.0,
@@ -3917,7 +3910,7 @@ pub fn glass_expanded_fallback(
             w: f64::from(width),
             h: f64::from(popup_height(m)),
         },
-        0.54,
+        side == "left",
     );
     let mut scene = expanded(cr, m, id, width);
     let hw = bar_width(cr, m, side, output);
@@ -3933,17 +3926,18 @@ pub fn glass_expanded_fallback(
         f64::from(frame.header.1),
         f64::from(frame.header_scale),
     );
+    let y_scale = f64::from(frame.header_height) / bar_header_height(m, side);
     let _ = cr.save();
     cr.translate(x, y);
-    cr.scale(scale, scale);
+    cr.scale(scale, y_scale);
     let _offset = OffsetScope::enter(x, y);
     let mut hs = bar_header(cr, m, id, side, output, hw, scene.hits.len());
     let _ = cr.restore();
     for h in &mut hs.hits {
         h.rect.x = h.rect.x * scale + x;
-        h.rect.y = h.rect.y * scale + y;
+        h.rect.y = h.rect.y * y_scale + y;
         h.rect.w *= scale;
-        h.rect.h *= scale;
+        h.rect.h *= y_scale;
     }
     scene.hits.extend(hs.hits);
     scene
@@ -3962,6 +3956,9 @@ fn bar_content_width(cr: &Context, m: &Model, side: &str, output: &str) -> i32 {
                     .iter()
                     .filter(|w| w["output"] == output)
                     .count() as i32
+        }
+        "center" if JOINED.with(|v| v.get()) && m.page == Page::Calendar => {
+            (super::expansion::CALENDAR_CLOCK_WIDTH / super::expansion::CLOCK_SCALE).ceil() as i32
         }
         "center" => (super::header_ui::clock_width(
             cr,
@@ -3993,6 +3990,43 @@ pub fn bar_header_width(cr: &Context, m: &Model, side: &str, output: &str) -> i3
     let _joined = JoinedScope::enter();
     bar_width(cr, m, side, output)
 }
+pub fn bar_header_height(m: &Model, side: &str) -> f64 {
+    if side == "center" && m.page == Page::Calendar && m.osd.is_none() {
+        f64::from(super::expansion::CALENDAR_WIDGET_HEIGHT)
+            / f64::from(super::expansion::CLOCK_SCALE)
+    } else {
+        34.0
+    }
+}
+fn calendar_clock_widget(cr: &Context, m: &Model, now: &glib::DateTime) {
+    // This cached widget is scaled during expansion. Keep glyph metrics stable
+    // across its packed raster transform and fractional output scales.
+    let _smooth = super::text_cache::SmoothText::enter(cr);
+    let mut font = pango::FontDescription::from_string(&m.font);
+    font.set_weight(pango::Weight::Medium);
+    font.set_absolute_size(super::expansion::CALENDAR_CLOCK_SIZE * f64::from(pango::SCALE));
+    super::header_ui::clock(
+        cr,
+        &font.to_string(),
+        &now.format("%H:%M").unwrap(),
+        Rect {
+            x: CALENDAR_DATE.x,
+            y: f64::from(super::expansion::CALENDAR_CLOCK_Y),
+            w: CALENDAR_DATE.w,
+            h: 34.0 * f64::from(super::expansion::CLOCK_SCALE),
+        },
+    );
+    text(
+        cr,
+        &m.font,
+        &calendar_date(now),
+        CALENDAR_DATE,
+        false,
+        false,
+        18.0,
+        pango::Alignment::Center,
+    );
+}
 fn clock_font(m: &Model) -> String {
     let mut font = pango::FontDescription::from_string(&m.font);
     if JOINED.with(|v| v.get()) {
@@ -4017,31 +4051,8 @@ fn header_clock(m: &Model, now: &glib::DateTime) -> String {
 pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i32) -> Scene {
     let _palette = GlassScope::enter();
     let _bar = BarScope::enter();
-    if !JOINED.with(|v| v.get()) {
-        round(
-            cr,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: f64::from(width),
-                h: 34.0,
-            },
-            PANEL_RADIUS,
-        );
-        cr.set_source_rgba(25.0 / 255.0, 27.0 / 255.0, 34.0 / 255.0, 0.54);
-        let _ = cr.fill();
-        crystal_exact(
-            cr,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: f64::from(width),
-                h: 34.0,
-            },
-            PANEL_RADIUS,
-            false,
-        );
-        bar_rim(
+    if !JOINED.with(|v| v.get()) && !GPU_BAR.with(|v| v.get()) {
+        bar_material(
             cr,
             Rect {
                 x: 0.0,
@@ -4082,7 +4093,7 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
                 w: 28.0,
                 h: 28.0,
             };
-            let active = s["is_active"].as_bool().unwrap_or(false) && !GPU_MARKER.with(|v| v.get());
+            let active = s["is_active"].as_bool().unwrap_or(false) && !GPU_BAR.with(|v| v.get());
             cr.new_path();
             cr.arc(
                 r.x + r.w / 2.0,
@@ -4120,24 +4131,42 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
             };
         }
         let now = glib::DateTime::now_local().unwrap();
-        let date = header_clock(m, &now);
-        super::header_ui::clock(
-            cr,
-            &clock_font(m),
-            &date,
-            Rect {
-                x: 8.0,
-                y: 0.0,
-                w: f64::from(width) - 16.0,
-                h: 34.0,
-            },
-        );
+        if JOINED.with(|v| v.get()) && m.page == Page::Calendar {
+            // Pack with a uniform CTM so shaping and glyph metrics match the
+            // final widget. The host allocates bar_header_height * raster_scale.
+            let _ = cr.save();
+            cr.translate(f64::from(width) * 0.5, 0.0);
+            cr.scale(
+                1.0 / f64::from(super::expansion::CLOCK_SCALE),
+                1.0 / f64::from(super::expansion::CLOCK_SCALE),
+            );
+            cr.translate(-(CALENDAR_DATE.x + CALENDAR_DATE.w * 0.5), 0.0);
+            calendar_clock_widget(cr, m, &now);
+            let _ = cr.restore();
+        } else {
+            let date = header_clock(m, &now);
+            super::header_ui::clock(
+                cr,
+                &clock_font(m),
+                &date,
+                Rect {
+                    x: 8.0,
+                    y: 0.0,
+                    w: f64::from(width) - 16.0,
+                    h: 34.0,
+                },
+            );
+        }
         p.hit(
             Rect {
                 x: 0.0,
                 y: 0.0,
                 w: f64::from(width),
-                h: 34.0,
+                h: if JOINED.with(|v| v.get()) {
+                    bar_header_height(m, side)
+                } else {
+                    34.0
+                },
             },
             Action::Page(Page::Calendar),
             "달력",
@@ -4290,9 +4319,9 @@ pub fn bar(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i3
     }
 }
 pub fn bar_gpu(cr: &Context, m: &Model, id: u32, side: &str, output: &str, width: i32) -> Scene {
-    let previous = GPU_MARKER.with(|v| v.replace(true));
+    let previous = GPU_BAR.with(|v| v.replace(true));
     let scene = bar(cr, m, id, side, output, width);
-    GPU_MARKER.with(|v| v.set(previous));
+    GPU_BAR.with(|v| v.set(previous));
     scene
 }
 pub fn workspace_marker(m: &Model, output: &str) -> Option<f32> {
@@ -4893,6 +4922,35 @@ mod tests {
         }
     }
     #[test]
+    fn gpu_bar_caches_ink_without_a_second_material_layer() {
+        let m = Model::new();
+        for side in ["left", "center", "right"] {
+            let render = |gpu| {
+                let mut image =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 34).unwrap();
+                {
+                    let cr = Context::new(&image).unwrap();
+                    if gpu {
+                        bar_gpu(&cr, &m, 1, side, "", 480);
+                    } else {
+                        bar(&cr, &m, 1, side, "", 480);
+                    }
+                }
+                image.flush();
+                let pixels = image.data().unwrap().to_vec();
+                pixels
+            };
+            let software = render(false);
+            let gpu = render(true);
+            assert!(software[240 * 4 + 3] > 0);
+            assert_eq!(
+                gpu[240 * 4 + 3],
+                0,
+                "{side}: material must only be composited once by EGL"
+            );
+        }
+    }
+    #[test]
     fn glass_gauge_fill_is_opaque_white_not_translucent_gray() {
         let _palette = GlassScope::enter();
         let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 100, 38).unwrap();
@@ -5096,6 +5154,14 @@ mod tests {
                 assert!(title.w > 200.0);
             }
         }
+    }
+    #[test]
+    fn dnd_icon_is_red_only_when_notifications_are_disabled() {
+        let normal = notification_button_ink("notification", false);
+        let muted = notification_button_ink("notification", true);
+        assert!(muted.0 > muted.1 * 1.8 && muted.0 > muted.2 * 1.8);
+        assert_eq!(notification_button_ink("trash", true), normal);
+        assert_eq!(notification_button_ink("trash", false), normal);
     }
     #[test]
     fn notification_headers_and_cards_have_equal_width_and_glass_controls_are_square() {
@@ -5578,14 +5644,14 @@ mod tests {
         let bytes = image.data().unwrap();
         // The clock lives in its own animated header texture. Its body area
         // must remain transparent, without a second rounded plate underneath.
-        for y in 20..CALENDAR_DATE.y as usize {
+        for y in 20..(CALENDAR_DATE.y + CALENDAR_DATE.h) as usize {
             for x in 20..300 {
                 assert_eq!(bytes[y * stride + x * 4 + 3], 0);
             }
         }
     }
     #[test]
-    fn calendar_today_caption_is_separate_from_the_animated_clock() {
+    fn calendar_today_caption_shares_the_clock_canvas_and_has_room_before_calendar() {
         let mut m = Model::new();
         m.page = Page::Calendar;
         let now = glib::DateTime::from_local(2026, 11, 7, 22, 20, 0.0).unwrap();
@@ -5598,7 +5664,10 @@ mod tests {
         let cr = Context::new(&image).unwrap();
         let scene = expanded(&cr, &m, 1, 780);
         assert_eq!(CALENDAR_DATE.x + CALENDAR_DATE.w / 2.0, 160.0);
-        assert!(CALENDAR_DATE.y + CALENDAR_DATE.h + 12.0 <= 64.0 + CALENDAR_SHIFT);
+        assert_eq!(
+            64.0 + CALENDAR_SHIFT - CALENDAR_DATE.y - CALENDAR_DATE.h,
+            28.0
+        );
         assert!(CALENDAR_DATE.y + CALENDAR_DATE.h < CALENDAR_GRID.y);
         for h in scene
             .hits
@@ -5610,6 +5679,81 @@ mod tests {
                 h.rect.y > 94.0,
                 "month navigation must stay below the clock widget"
             );
+        }
+    }
+    #[test]
+    fn calendar_clock_header_keeps_its_target_and_system_font_at_fractional_scales() {
+        let bounds = |image: &mut cairo::ImageSurface, x: f64, sx: f64, sy: f64| {
+            let (w, h, stride) = (image.width(), image.height(), image.stride() as usize);
+            let bytes = image.data().unwrap();
+            let mut boxes = [(f64::MAX, f64::MAX, f64::MIN, f64::MIN); 2];
+            for py in 0..h as usize {
+                for px in 0..w as usize {
+                    if bytes[py * stride + px * 4 + 3] <= 32 {
+                        continue;
+                    }
+                    let (x, y) = (x + (px as f64 + 0.5) * sx, (py as f64 + 0.5) * sy);
+                    let b = &mut boxes[usize::from(y >= CALENDAR_DATE.y)];
+                    b.0 = b.0.min(x);
+                    b.1 = b.1.min(y);
+                    b.2 = b.2.max(x);
+                    b.3 = b.3.max(y);
+                }
+            }
+            boxes
+        };
+        let mut m = Model::new();
+        m.page = Page::Calendar;
+        let now = glib::DateTime::now_local().unwrap();
+        for font in ["Sans 9", "Serif 15", "Monospace 11"] {
+            m.font = font.into();
+            for dpi in [1.0_f64, 1.25, 1.5, 2.0] {
+                let mut direct = cairo::ImageSurface::create(
+                    cairo::Format::ARgb32,
+                    (320.0 * dpi).ceil() as i32,
+                    (f64::from(crate::expansion::CALENDAR_WIDGET_HEIGHT) * dpi).ceil() as i32,
+                )
+                .unwrap();
+                {
+                    let cr = Context::new(&direct).unwrap();
+                    cr.scale(dpi, dpi);
+                    calendar_clock_widget(&cr, &m, &now);
+                }
+                let raster_scale = f64::from(crate::expansion::CLOCK_SCALE) * dpi;
+                let width = bar_header_width(&Context::new(&direct).unwrap(), &m, "center", "");
+                assert_eq!(width, 94, "font/DPI must not shift the target canvas");
+                let mut packed = cairo::ImageSurface::create(
+                    cairo::Format::ARgb32,
+                    (f64::from(width) * raster_scale).ceil() as i32,
+                    (bar_header_height(&m, "center") * raster_scale).ceil() as i32,
+                )
+                .unwrap();
+                {
+                    let cr = Context::new(&packed).unwrap();
+                    cr.scale(raster_scale, raster_scale);
+                    bar_header(&cr, &m, 1, "center", "", width, 0);
+                }
+                let frame = crate::expansion::layout(1.0, 221.0, (780, 500), width as f32, true);
+                let expected = bounds(&mut direct, 0.0, 1.0 / dpi, 1.0 / dpi);
+                let (packed_width, packed_height) = (packed.width(), packed.height());
+                let actual = bounds(
+                    &mut packed,
+                    f64::from(frame.header.0),
+                    f64::from(frame.header_scale) * f64::from(width) / f64::from(packed_width),
+                    f64::from(frame.header_height) / f64::from(packed_height),
+                );
+                for (a, b) in actual.into_iter().zip(expected) {
+                    assert!(a.0.is_finite() && a.0 < a.2 && a.1 < a.3);
+                    assert!(
+                        ((a.0 + a.2 - b.0 - b.2) * 0.5).abs() <= 1.5,
+                        "font={font}, dpi={dpi}: packed={a:?}, direct={b:?}"
+                    );
+                    for (a, b) in [a.0, a.1, a.2, a.3].into_iter().zip([b.0, b.1, b.2, b.3]) {
+                        assert!((a - b).abs() <= 2.0, "font={font}, dpi={dpi}: {a} vs {b}");
+                    }
+                }
+                assert_eq!(m.font, font);
+            }
         }
     }
     #[test]
@@ -6217,6 +6361,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn media_progress_uses_gpu_motion_but_scrubbing_stays_exact() {
+        let mut m = Model::new();
+        m.readonly = true;
+        m.common.media = Some(crate::control_backend::Media {
+            player: "test".into(),
+            track: "/track/one".into(),
+            duration: Some(100_000_000),
+            position: Some(25_000_000),
+            can_seek: true,
+            ..Default::default()
+        });
+        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, WIDTH, HEIGHT).unwrap();
+        let cr = Context::new(&image).unwrap();
+        let capture = GaugeCapture::enter();
+        let scene = expanded(&cr, &m, 1, WIDTH);
+        let gauges = capture.take();
+        assert_eq!(gauges.len(), 1);
+        assert_eq!(gauges[0].key, "media-progress:test:/track/one");
+        assert_eq!(gauges[0].level, 0.25);
+        assert!(!gauges[0].direct);
+        assert!(
+            !m.animating(),
+            "GPU progress must not arm full-scene animation"
+        );
+        let target = Slider::Media("test".into(), "/track/one".into());
+        let rect = scene
+            .hits
+            .iter()
+            .find_map(|h| matches!(h.action, Action::Slider(Slider::Media(_, _))).then_some(h.rect))
+            .unwrap();
+        m.dragging = Some((1, target.clone(), rect));
+        m.slider(&target, 41.125, true);
+        expanded(&cr, &m, 1, WIDTH);
+        let gauges = capture.take();
+        assert!((gauges[0].level - 0.41125).abs() < 0.00001);
+        assert!(gauges[0].direct);
+        m.dragging = None;
+        expanded(&cr, &m, 1, WIDTH);
+        assert!(
+            capture.take()[0].direct,
+            "keep the seek target until it is acknowledged"
+        );
+    }
     #[test]
     fn media_header_padding_does_not_overlap_controls_or_sliders() {
         let mut m = Model::new();

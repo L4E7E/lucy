@@ -73,6 +73,18 @@ fn calendar_header_return(amount: f32) -> f32 {
     let t = (1.0 - amount / 0.55).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+fn calendar_clock_layout(amount: f32, calendar: bool) -> [f32; 2] {
+    if !calendar {
+        return [1.0, 1.0];
+    }
+    // The caption travels with the clock, but leaves before the collapsed bar's
+    // date returns. Never show two dates in separate rows during the handoff.
+    let t = ((amount - 0.55) / 0.25).clamp(0.0, 1.0);
+    [
+        super::expansion::CALENDAR_DATE_Y / super::expansion::CALENDAR_WIDGET_HEIGHT,
+        t * t * (3.0 - 2.0 * t),
+    ]
+}
 
 pub fn spring(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -173,9 +185,9 @@ struct Program {
     header_image: Option<glow::NativeUniformLocation>,
     clock_previous: Option<glow::NativeUniformLocation>,
     clock_progress: Option<glow::NativeUniformLocation>,
+    clock_layout: Option<glow::NativeUniformLocation>,
     header_fade: Option<glow::NativeUniformLocation>,
     return_image: Option<glow::NativeUniformLocation>,
-    return_width: Option<glow::NativeUniformLocation>,
     return_blend: Option<glow::NativeUniformLocation>,
     motion_mode: Option<glow::NativeUniformLocation>,
     motion_rect: Option<glow::NativeUniformLocation>,
@@ -188,6 +200,7 @@ struct Program {
     shimmer_rect: Option<glow::NativeUniformLocation>,
     shimmer_position: Option<glow::NativeUniformLocation>,
     corner_radius: Option<glow::NativeUniformLocation>,
+    bar_style: Option<glow::NativeUniformLocation>,
     lock_sharp: Option<glow::NativeUniformLocation>,
     lock_amount: Option<glow::NativeUniformLocation>,
     lock_texel: Option<glow::NativeUniformLocation>,
@@ -285,9 +298,9 @@ uniform vec4 headerRect;
 uniform sampler2D headerImage;
 uniform sampler2D clockPrevious;
 uniform float clockProgress;
+uniform vec2 clockLayout;
 uniform float headerFade;
 uniform sampler2D returnImage;
-uniform float returnWidth;
 uniform float returnBlend;
 uniform float motionMode;
 uniform vec4 motionRect;
@@ -300,9 +313,38 @@ uniform vec2 logicalSize;
 uniform vec4 shimmerRect;
 uniform float shimmerPosition;
 uniform float cornerRadius;
+uniform float barStyle;
 uniform sampler2D lockSharp;
 uniform float lockAmount;
 uniform vec2 lockTexel;
+float shellEdge(vec2 pos,vec2 size){
+    float radius=min(cornerRadius,min(size.x,size.y)*0.5);
+    vec2 d=abs(pos-size*0.5)-(size*0.5-vec2(radius));
+    return length(max(d,vec2(0.0)))+min(max(d.x,d.y),0.0)-radius;
+}
+// One material for the idle bar, every expansion frame, and the open panel.
+// Neither a height threshold nor a second rim can swap its appearance.
+vec4 shellMaterial(vec2 pos,vec2 size,float edge,float left){
+    vec2 axis=vec2(size.x*0.65,size.y);
+    float g=clamp(dot(pos,axis)/dot(axis,axis),0.0,1.0);
+    vec4 highlight=g<0.48
+        ?mix(vec4(1.0,1.0,1.0,0.115),vec4(0.91,0.95,1.0,0.035),g/0.48)
+        :mix(vec4(0.91,0.95,1.0,0.035),vec4(1.0,1.0,1.0,0.065),(g-0.48)/0.52);
+    vec4 base=vec4(vec3(25.0,27.0,34.0)/255.0*0.54,0.54);
+    base=vec4(highlight.rgb*highlight.a,highlight.a)+base*(1.0-highlight.a);
+    float diagonal=clamp(dot(pos,size)/dot(size,size),0.0,1.0);
+    vec4 crystal=diagonal<0.35
+        ?mix(vec4(1.0,1.0,1.0,0.35),vec4(1.0,1.0,1.0,0.045),diagonal/0.35)
+        :mix(vec4(1.0,1.0,1.0,0.045),vec4(0.86,0.93,1.0,0.17),(diagonal-0.35)/0.65);
+    float line=1.0-smoothstep(0.0,0.8,abs(edge+0.6));
+    float alpha=crystal.a*line;
+    base=vec4(crystal.rgb*alpha,alpha)+base*(1.0-alpha);
+    float y=pos.y/size.y;
+    float top=mix(0.40,0.62,left),bottom=mix(0.24,0.34,left);
+    float rim=y<0.45?mix(top,0.055,y/0.45):mix(0.055,bottom,(y-0.45)/0.55);
+    alpha=rim*(1.0-smoothstep(0.0,1.0,abs(edge+0.75)));
+    return vec4(vec3(alpha),alpha)+base*(1.0-alpha);
+}
 vec4 illuminate(vec4 scene, vec2 q){
     if(shimmerRect.z<=0.0)return scene;
     vec2 local=(q-shimmerRect.xy)/shimmerRect.zw;
@@ -388,38 +430,9 @@ void main(){
     }
     if(joined>=0.0){
         vec2 pos=uv*extent.xy;
-        float radius=min(cornerRadius,min(extent.x,extent.y)*0.5);
-        vec2 d=abs(pos-extent.xy*0.5)-(extent.xy*0.5-vec2(radius));
-        float edge=length(max(d,vec2(0.0)))+min(max(d.x,d.y),0.0)-radius;
+        float edge=shellEdge(pos,extent.xy);
         float mask=1.0-smoothstep(-0.7,0.3,edge);
-        float light=mix(0.115,0.05,clamp(uv.y*1.5,0.0,1.0));
-        vec4 base=vec4(vec3(25.0,27.0,34.0)/255.0*0.54,0.54);
-        base=vec4(vec3(light),light)+base*(1.0-light);
-        float rim=(1.0-smoothstep(0.4,1.3,abs(edge+0.9)))*mix(0.40,0.16,uv.y);
-        base=vec4(vec3(rim),rim)+base*(1.0-rim);
-        if(extent.y<100.0){
-            // Match draw::bar's material rather than the expanded-panel rim.
-            // Fixed height/radius throughout OSD motion: only width changes.
-            vec2 axis=vec2(extent.x*0.65,extent.y);
-            float g=clamp(dot(pos,axis)/dot(axis,axis),0.0,1.0);
-            vec4 highlight=g<0.48
-                ?mix(vec4(1.0,1.0,1.0,0.115),vec4(0.91,0.95,1.0,0.035),g/0.48)
-                :mix(vec4(0.91,0.95,1.0,0.035),vec4(1.0,1.0,1.0,0.065),(g-0.48)/0.52);
-            vec4 barBase=vec4(vec3(25.0,27.0,34.0)/255.0*0.54,0.54);
-            barBase=vec4(highlight.rgb*highlight.a,highlight.a)+barBase*(1.0-highlight.a);
-            float diagonal=clamp(dot(pos,extent.xy)/dot(extent.xy,extent.xy),0.0,1.0);
-            vec4 crystal=diagonal<0.35
-                ?mix(vec4(1.0,1.0,1.0,0.35),vec4(1.0,1.0,1.0,0.045),diagonal/0.35)
-                :mix(vec4(1.0,1.0,1.0,0.045),vec4(0.86,0.93,1.0,0.17),(diagonal-0.35)/0.65);
-            float line=1.0-smoothstep(0.0,0.8,abs(edge+0.6));
-            float alpha=crystal.a*line;
-            barBase=vec4(crystal.rgb*alpha,alpha)+barBase*(1.0-alpha);
-            float barRim=uv.y<0.45?mix(0.40,0.055,uv.y/0.45):mix(0.055,0.24,(uv.y-0.45)/0.55);
-            alpha=barRim*(1.0-smoothstep(0.0,1.0,abs(edge+0.75)));
-            barBase=vec4(vec3(alpha),alpha)+barBase*(1.0-alpha);
-            // Do not switch materials abruptly at the final 35 -> 34 px frame.
-            base=mix(barBase,base,smoothstep(34.0,100.0,extent.y));
-        }
+        vec4 base=shellMaterial(pos,extent.xy,edge,0.0);
         vec2 q=(pos-vec2((extent.x-extent.z)*0.5,extent.w<=34.0?0.0:10.0*(1.0-joined)))/extent.zw;
         vec4 body=regional(q);
         if(blending>0.5&&abs(motionMode)<0.5){
@@ -428,35 +441,42 @@ void main(){
         }
         body*=smoothstep(0.08,0.65,joined);
         vec4 result=body+base*(1.0-body.a);
+        vec4 clockInk=vec4(0.0);
         vec2 h=(pos-headerRect.xy)/headerRect.zw;
         if(h.x>=0.0&&h.x<=1.0&&h.y>=0.0&&h.y<=1.0){
             vec4 ink=texture2D(headerImage,h).bgra;
-            if(clockProgress<1.0){
+            if(clockProgress<1.0&&h.y<clockLayout.x){
                 // Move only the cached clock ink; material and Niri blur stay still.
                 vec2 entering=h-vec2(0.0,(1.0-clockProgress)*0.12);
                 vec2 leaving=h+vec2(0.0,clockProgress*0.12);
                 vec4 next=texture2D(headerImage,clamp(entering,0.0,1.0)).bgra;
                 vec4 old=texture2D(clockPrevious,clamp(leaving,0.0,1.0)).bgra;
-                next*=step(0.0,entering.y)*step(entering.y,1.0);
-                old*=step(0.0,leaving.y)*step(leaving.y,1.0);
+                next*=step(0.0,entering.y)*(1.0-step(clockLayout.x,entering.y));
+                old*=step(0.0,leaving.y)*(1.0-step(clockLayout.x,leaving.y));
                 ink=mix(old,next,clockProgress);
             }
-            ink*=(1.0-headerFade)*(1.0-returnBlend);
-            result=ink+result*(1.0-ink.a);
-        }
-        if(returnBlend>0.0){
-            // Keep both clock layouts on the same moving center: otherwise
-            // the date appears above a second, fading HH:MM during collapse.
-            vec2 origin=headerRect.xy+headerRect.zw*0.5-vec2(returnWidth,34.0)*0.5;
-            vec2 r=(pos-origin)/vec2(returnWidth,34.0);
-            if(r.x>=0.0&&r.x<=1.0&&r.y>=0.0&&r.y<=1.0){
-                vec4 ink=texture2D(returnImage,r).bgra*returnBlend;
-                result=ink+result*(1.0-ink.a);
+            if(h.y>=clockLayout.x)ink*=clockLayout.y;
+            clockInk=ink*(1.0-headerFade);
+            if(returnBlend>0.0){
+                // One moving canvas and one premultiplied composite, including
+                // overlap pixels. A second over operation leaves double ink.
+                clockInk=mix(clockInk,texture2D(returnImage,h).bgra,returnBlend);
             }
         }
+        result=clockInk+result*(1.0-clockInk.a);
         gl_FragColor=result*mask;return;
     }
     vec4 plain=illuminate(regional(uv),uv);
+    if(barStyle>=0.0){
+        vec2 pos=uv*logicalSize;
+        float edge=shellEdge(pos,logicalSize);
+        float mask=1.0-smoothstep(-0.7,0.3,edge);
+        vec4 base=shellMaterial(pos,logicalSize,edge,barStyle);
+        vec4 ink=plain;
+        if(blending>0.5)ink=mix(sampleScene(previousImage,uv,ratios.zw),plain,progress);
+        ink=decorate(ink,uv);
+        gl_FragColor=(ink+base*(1.0-ink.a))*mask;return;
+    }
     if(abs(motionMode)>0.5){gl_FragColor=plain;return;}
     if(blending<0.5){gl_FragColor=decorate(plain,uv);return;}
     float t=clamp(progress,0.0,1.0);
@@ -510,9 +530,9 @@ void main(){
             header_image: gl.get_uniform_location(native, "headerImage"),
             clock_previous: gl.get_uniform_location(native, "clockPrevious"),
             clock_progress: gl.get_uniform_location(native, "clockProgress"),
+            clock_layout: gl.get_uniform_location(native, "clockLayout"),
             header_fade: gl.get_uniform_location(native, "headerFade"),
             return_image: gl.get_uniform_location(native, "returnImage"),
-            return_width: gl.get_uniform_location(native, "returnWidth"),
             return_blend: gl.get_uniform_location(native, "returnBlend"),
             motion_mode: gl.get_uniform_location(native, "motionMode"),
             motion_rect: gl.get_uniform_location(native, "motionRect"),
@@ -525,6 +545,7 @@ void main(){
             shimmer_rect: gl.get_uniform_location(native, "shimmerRect"),
             shimmer_position: gl.get_uniform_location(native, "shimmerPosition"),
             corner_radius: gl.get_uniform_location(native, "cornerRadius"),
+            bar_style: gl.get_uniform_location(native, "barStyle"),
             lock_sharp: gl.get_uniform_location(native, "lockSharp"),
             lock_amount: gl.get_uniform_location(native, "lockAmount"),
             lock_texel: gl.get_uniform_location(native, "lockTexel"),
@@ -554,6 +575,34 @@ struct Header {
     texture: glow::NativeTexture,
     fingerprint: u64,
     width: f32,
+    size: (i32, i32),
+}
+unsafe fn upload_header_pixels(gl: &glow::Context, bytes: &[u8], w: i32, h: i32, reuse: bool) {
+    if reuse {
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            w,
+            h,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(bytes)),
+        );
+    } else {
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(bytes)),
+        );
+    }
 }
 const CLOCK_TURN_MS: u64 = 260;
 struct ClockTurn {
@@ -615,6 +664,7 @@ pub struct Window {
     launcher_close_from: f32,
     lock_backdrop: Option<LockBackdrop>,
     background: f32,
+    bar_style: Option<bool>,
     expansion: Option<super::expansion::Expansion>,
     header: Option<Header>,
     return_header: Option<Header>,
@@ -693,6 +743,7 @@ impl Window {
             launcher_close_from: 1.0,
             lock_backdrop: None,
             background: 0.8,
+            bar_style: None,
             expansion: None,
             header: None,
             return_header: None,
@@ -724,6 +775,9 @@ impl Window {
     }
     pub fn set_background(&mut self, alpha: f32) {
         self.background = alpha;
+    }
+    pub fn set_bar_style(&mut self, left: Option<bool>) {
+        self.bar_style = left;
     }
     pub fn set_gauges(
         &mut self,
@@ -963,21 +1017,16 @@ impl Window {
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                w,
-                h,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(bytes)),
-            );
+            let reuse = self
+                .return_header
+                .as_ref()
+                .is_some_and(|header| header.size == (w, h));
+            upload_header_pixels(gl, bytes, w, h, reuse);
             self.return_header = Some(Header {
                 texture,
                 fingerprint,
                 width,
+                size: (w, h),
             });
         }
     }
@@ -1022,6 +1071,11 @@ impl Window {
         let gl = self.gpu.gl.borrow();
         let gl = gl.as_ref().unwrap();
         unsafe {
+            let reuse = !animate
+                && self
+                    .header
+                    .as_ref()
+                    .is_some_and(|header| header.size == (w, h));
             let texture = match (&self.header, animate) {
                 (Some(h), false) => h.texture,
                 _ => match gl.create_texture() {
@@ -1049,21 +1103,12 @@ impl Window {
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                w,
-                h,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(bytes)),
-            );
+            upload_header_pixels(gl, bytes, w, h, reuse);
             self.header = Some(Header {
                 texture,
                 fingerprint,
                 width: logical_width,
+                size: (w, h),
             });
         }
         true
@@ -1294,6 +1339,11 @@ impl Window {
             gl.disable(glow::BLEND);
             gl.use_program(Some(p.native));
             gl.uniform_1_f32(p.corner_radius.as_ref(), super::draw::PANEL_RADIUS as f32);
+            gl.uniform_1_f32(
+                p.bar_style.as_ref(),
+                self.bar_style
+                    .map_or(-1.0, |left| if left { 1.0 } else { 0.0 }),
+            );
             let lock = self.lock_backdrop.as_ref();
             gl.uniform_1_f32(
                 p.lock_amount.as_ref(),
@@ -1354,15 +1404,16 @@ impl Window {
                 self.return_header.as_ref().map(|h| h.texture),
             );
             gl.uniform_1_f32(
-                p.return_width.as_ref(),
-                self.return_header.as_ref().map_or(1.0, |h| h.width),
-            );
-            gl.uniform_1_f32(
                 p.return_blend.as_ref(),
                 expansion
                     .filter(|_| self.return_header.is_some())
                     .map_or(0.0, |f| calendar_header_return(f.amount)),
             );
+            let clock_layout = calendar_clock_layout(
+                expansion.map_or(1.0, |f| f.amount),
+                self.expansion.as_ref().is_some_and(|e| e.calendar),
+            );
+            gl.uniform_2_f32(p.clock_layout.as_ref(), clock_layout[0], clock_layout[1]);
             let clock_t = self.clock_turn.as_ref().map_or(1.0, ClockTurn::time);
             gl.uniform_1_f32(
                 p.clock_progress.as_ref(),
@@ -1449,7 +1500,7 @@ impl Window {
                     f.header.0,
                     f.header.1,
                     header.width * f.header_scale,
-                    34.0 * f.header_scale,
+                    f.header_height,
                 );
             }
             let a = self.sizes[self.front];
@@ -1513,6 +1564,7 @@ impl Window {
                         ),
                         alpha,
                         pixel,
+                        1,
                     );
                 }
                 renderer.paint(
@@ -1525,6 +1577,7 @@ impl Window {
                     ),
                     alpha,
                     pixel,
+                    0,
                 );
             }
             #[cfg(test)]
@@ -1568,7 +1621,7 @@ impl Window {
                         ((frame.header.0 + 45.0 * frame.header_scale) / frame.size.0 as f32
                             * w as f32) as i32,
                         h - 1
-                            - ((frame.header.1 + 17.0 * frame.header_scale) / frame.size.1 as f32
+                            - ((frame.header.1 + frame.header_height * 0.5) / frame.size.1 as f32
                                 * h as f32) as i32,
                         1,
                         1,
@@ -1580,6 +1633,10 @@ impl Window {
                 assert!(
                     f32::from(pixel[2]) + 2.0 >= 255.0 * blend,
                     "bar ink must appear while shrinking, amount={amount}: {pixel:?}"
+                );
+                assert!(
+                    (f32::from(pixel[0]) - 255.0 * (1.0 - blend)).abs() <= 2.0,
+                    "clock/bar overlap must be one premultiplied mix, amount={amount}: {pixel:?}"
                 );
                 if amount == 0.0 {
                     assert_eq!(
@@ -1643,6 +1700,136 @@ impl Window {
         println!("OSD GPU: no cached clock pixels across 3 openings and 15 intermediate frames");
     }
     /// GPU readback is deliberately test-only: never retain a live lock raster.
+    fn verify_inline_gauge_contrast(&mut self) {
+        use super::model::Rect;
+        let old_size = self.logical_size;
+        self.logical_size = (480.0, 500.0);
+        let mut image = cairo::ImageSurface::create(cairo::Format::ARgb32, 480, 500).unwrap();
+        {
+            let cr = cairo::Context::new(&image).unwrap();
+            cr.set_source_rgba(0.32, 0.33, 0.36, super::gauge::TRACK_ALPHA);
+            cr.paint().unwrap();
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            for x in [44.0, 400.0] {
+                cr.rectangle(x, 99.0, 12.0, 12.0);
+                cr.fill().unwrap();
+            }
+        }
+        image.flush();
+        for level in [0.0, 0.5, 1.0] {
+            self.gauges.clear();
+            self.set_gauges(
+                vec![super::gauge::Gauge {
+                    key: "inline-label-probe".into(),
+                    rect: Rect {
+                        x: 32.0,
+                        y: 90.0,
+                        w: 408.0,
+                        h: 30.0,
+                    },
+                    clip: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 480.0,
+                        h: 500.0,
+                    },
+                    radius: 15.0,
+                    vertical: false,
+                    alpha: 1.0,
+                    level,
+                    direct: false,
+                }],
+                (480, 500),
+                false,
+            );
+            self.update(&image.data().unwrap(), 480, 500, Effect::Immediate, true);
+            let mut inspect = |gl: &glow::Context, _: i32, h: i32| {
+                let read = |x| {
+                    let mut pixel = [0; 4];
+                    unsafe {
+                        gl.read_pixels(
+                            x,
+                            h - 1 - 105,
+                            1,
+                            1,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixel)),
+                        );
+                    }
+                    pixel[0]
+                };
+                for (x, covered) in [(50, level > 0.0), (406, level == 1.0)] {
+                    let ink = read(x);
+                    assert!(
+                        if covered { ink < 70 } else { ink > 220 },
+                        "GPU inline ink contrast at {level}: x={x}, ink={ink}"
+                    );
+                }
+                if level > 0.0 {
+                    assert!(read(90) > 245, "filled capsule must remain white");
+                }
+            };
+            assert!(self.present_frame(None, Some(&mut inspect)));
+        }
+        self.gauges.clear();
+        self.logical_size = old_size;
+        println!("GPU gauges: cached inline labels retain contrast at 0/50/100% fill");
+    }
+    fn verify_shell_material_continuity(&mut self) {
+        let old_size = self.logical_size;
+        let old_style = self.bar_style;
+        let capture = |window: &Self, frame| {
+            let mut pixels = vec![0; (window.w * window.h * 4) as usize];
+            let mut inspect = |gl: &glow::Context, w: i32, h: i32| unsafe {
+                gl.read_pixels(
+                    0,
+                    0,
+                    w,
+                    h,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+            };
+            assert!(window.present_frame(frame, Some(&mut inspect)));
+            pixels
+        };
+        for height in [34, 35, 60, 99, 100, 101, 250, 500] {
+            let size = (480, height);
+            self.finish_expansion();
+            self.set_indicator(None, size);
+            self.update(
+                &vec![0; (size.0 * size.1 * 4) as usize],
+                size.0,
+                size.1,
+                Effect::Immediate,
+                true,
+            );
+            self.set_bar_style(Some(false));
+            let stretched_bar = capture(self, None);
+            self.set_bar_style(None);
+            self.set_header(&[0; 4], 1, 1, 480.0);
+            self.begin_expansion(480, size, false, false);
+            let frame = super::expansion::Frame {
+                size,
+                header: (0.0, 0.0),
+                header_scale: 1.0,
+                header_height: 34.0,
+                amount: 1.0,
+                time: 1.0,
+            };
+            let panel = capture(self, Some(frame));
+            assert_eq!(
+                panel, stretched_bar,
+                "bar and panel material diverged at {height}px"
+            );
+        }
+        self.finish_expansion();
+        self.logical_size = old_size;
+        self.bar_style = old_style;
+        println!("Shell material: identical GPU pixels for bar and expanded panel at 8 heights (34–500px)");
+    }
     pub fn verify_text_copy(&mut self, expected: &[u8], logical: (i32, i32)) {
         let original_size = (self.w, self.h);
         let check = |window: &Self, frame, label| {
@@ -1694,6 +1881,8 @@ impl Window {
         self.finish_expansion();
         self.verify_overlay_excludes_cached_clock();
         self.verify_calendar_returns_to_the_cached_bar_before_restoration();
+        self.verify_inline_gauge_contrast();
+        self.verify_shell_material_continuity();
         self.update(
             expected,
             original_size.0,
@@ -1731,6 +1920,21 @@ impl Drop for Window {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calendar_caption_leaves_before_the_bar_date_returns() {
+        use super::*;
+        let mut previous = 0.0;
+        for step in 0..=100 {
+            let amount = step as f32 / 100.0;
+            let [bottom, caption] = calendar_clock_layout(amount, true);
+            assert!(bottom > 0.7 && bottom < 0.8);
+            assert!(caption >= previous);
+            assert_eq!(caption * calendar_header_return(amount), 0.0);
+            assert_eq!(calendar_clock_layout(amount, false), [1.0, 1.0]);
+            previous = caption;
+        }
+        assert_eq!(previous, 1.0);
+    }
     #[test]
     fn calendar_clock_becomes_the_bar_before_the_last_frame() {
         assert_eq!(super::calendar_header_return(1.0), 0.0);
